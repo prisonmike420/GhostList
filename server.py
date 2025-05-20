@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 async def handle_root(request):
     """Обработчик корневого маршрута для проверки работоспособности"""
-    return web.Response(text="GhostList активен", status=200)
+    return web.Response(text="GhostList работает", status=200)
 
 async def start_server():
     """Запуск HTTP-сервера для мониторинга"""

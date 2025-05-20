@@ -1,4 +1,40 @@
-#!/usr/bin/env python3
+async def get_user_full_info(user):
+    """Получение полной информации о пользователе"""
+    try:
+        # Получаем полную информацию о пользователе через GetFullUserRequest
+        full_user = await client(GetFullUserRequest(user.id))
+
+        # Сборка информации
+        user_info = {
+            'bio': getattr(full_user.full_user, 'about', None),
+            'is_scam': getattr(user, 'scam', False),
+            'is_fake': getattr(user, 'fake', False)
+        }
+
+        return user_info
+    except Exception as e:
+        logger.error(f"Ошибка при получении полной информации о пользователе {user.id}: {e}")
+        return {
+            'bio': None,
+            'is_scam': False,
+            'is_fake': False
+        }
+
+async def get_user_join_date(channel_peer, user_id):
+    """Получение даты присоединения пользователя к каналу"""
+    try:
+        participant = await client(GetParticipantRequest(
+            channel=channel_peer,
+            participant=user_id
+        ))
+
+        # Получаем дату присоединения, если она доступна
+        if hasattr(participant.participant, 'date'):
+            return participant.participant.date
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при получении даты присоединения пользователя {user_id}: {e}")
+        return None#!/usr/bin/env python3
 import os
 import logging
 import asyncio
@@ -20,6 +56,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from telethon import TelegramClient
 from telethon.tl.types import InputPeerChannel, ChannelParticipantsSearch, ChannelParticipantsAdmins, ChannelParticipantsBots
 from telethon.tl.functions.channels import GetParticipantsRequest, GetFullChannelRequest, GetParticipantRequest
+from telethon.tl.functions.users import GetFullUserRequest
 
 # Загрузка переменных окружения
 try:
@@ -238,8 +275,7 @@ async def update_progress_message(update: Update, message_id: int, text: str,
         keyboard = None
         if add_cancel_button:
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Отменить выгрузку", 
-                                     callback_data=f"cancel_download_{message_id}")]
+                [InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_download_{message_id}")]
             ])
 
         # Обновляем сообщение
@@ -255,7 +291,7 @@ async def update_progress_message(update: Update, message_id: int, text: str,
 async def get_channel_subscribers(channel_peer, update: Update, message_id: int) -> List[Dict]:
     """Получение списка подписчиков канала с отображением прогресса"""
     # Создаем объект отслеживания для отмены
-    download_tracker = {"cancelled": False}
+    download_tracker = {"cancelled": False, "partial_data": []}
     active_downloads[message_id] = download_tracker
 
     try:
@@ -268,49 +304,140 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
             True  # Добавляем кнопку отмены
         )
 
-        # Проверка на отмену
-        if download_tracker["cancelled"]:
-            del active_downloads[message_id]
-            return None
+        # Используем dictionary для хранения уникальных пользователей
+        unique_users = {}
 
         # Получаем информацию о канале
         try:
             full_channel_info = await client(GetFullChannelRequest(channel=channel_peer))
             participants_count = getattr(full_channel_info.full_chat, 'participants_count', 0)
 
-            # Проверка на ограничение Replit
-            if participants_count > MAX_SUBSCRIBERS_PER_REQUEST:
-                await update_progress_message(
-                    update,
-                    message_id,
-                    f"⚠️ Внимание: канал содержит {participants_count} подписчиков, что превышает лимит {MAX_SUBSCRIBERS_PER_REQUEST}. " +
-                    f"Из-за ограничений Replit будут выгружены только первые {MAX_SUBSCRIBERS_PER_REQUEST} подписчиков.",
-                    5,
-                    True
-                )
-                await asyncio.sleep(3)  # Даем время прочитать предупреждение
-            else:
-                await update_progress_message(
-                    update,
-                    message_id,
-                    f"Получение подписчиков канала. Примерное количество участников: {participants_count}",
-                    5,
-                    True
-                )
-        except Exception as e:
-            logger.error(f"Не удалось получить полную информацию о канале: {e}")
             await update_progress_message(
                 update,
                 message_id,
-                'Получение подписчиков канала. Не удалось определить размер канала.',
+                f"Получение подписчиков канала. Примерное количество участников: {participants_count}",
+                5,
+                True
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при получении информации о канале: {e}")
+            await update_progress_message(
+                update,
+                message_id,
+                "Получение подписчиков канала. Не удалось определить размер канала.",
                 5,
                 True
             )
 
         # Проверка на отмену
-        if download_tracker["cancelled"]:
+        if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+            await update_progress_message(
+                update,
+                message_id,
+                'Выгрузка отменена пользователем.',
+                100,
+                False
+            )
+            if message_id in active_downloads:
+                del active_downloads[message_id]
+            return []
+
+        # Поиск подписчиков - базовый вариант
+        try:
+            result = await client(GetParticipantsRequest(
+                channel=channel_peer,
+                filter=ChannelParticipantsSearch(''),
+                offset=0,
+                limit=200,
+                hash=0
+            ))
+
+            if result and result.users:
+                for user in result.users:
+                    # Проверка на отмену
+                    if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                        break
+
+                    user_key = f"id{user.id}"
+                    if user_key not in unique_users:
+                        try:
+                            # Получаем дополнительную информацию
+                            full_info = await get_user_full_info(user)
+                            join_date = await get_user_join_date(channel_peer, user.id)
+
+                            # Сохраняем поля пользователя
+                            user_data = {
+                                'id': user.id,
+                                'username': getattr(user, 'username', None),
+                                'firstName': getattr(user, 'first_name', None),
+                                'lastName': getattr(user, 'last_name', None),
+                                'phone': getattr(user, 'phone', None),
+                                'bot': getattr(user, 'bot', False),
+                                'deleted': getattr(user, 'deleted', False),
+                                'premium': getattr(user, 'premium', False),
+                                'bio': full_info['bio'],
+                                'is_scam': full_info['is_scam'],
+                                'is_fake': full_info['is_fake'],
+                                'join_date': join_date.isoformat() if join_date else None
+                            }
+                            unique_users[user_key] = user_data
+
+                            if message_id in active_downloads:
+                                active_downloads[message_id]["partial_data"].append(user_data)
+                        except Exception as user_error:
+                            logger.error(f"Ошибка при обработке пользователя {user.id}: {user_error}")
+        except Exception as e:
+            logger.error(f"Ошибка при получении подписчиков: {e}")
+
+        # Проверка на отмену после цикла
+        if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+            await update_progress_message(
+                update,
+                message_id,
+                'Выгрузка отменена пользователем.',
+                100,
+                False
+            )
+            if message_id in active_downloads:
+                del active_downloads[message_id]
+            return []
+
+        # Завершающее сообщение
+        await update_progress_message(
+            update,
+            message_id,
+            f"Получение подписчиков завершено! Найдено {len(unique_users)} участников.",
+            100,
+            False
+        )
+
+        # Удаляем из активных загрузок
+        if message_id in active_downloads:
             del active_downloads[message_id]
-            return None
+
+        # Возвращаем список
+        return list(unique_users.values())
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении подписчиков: {e}")
+
+        try:
+            # Сообщаем об ошибке
+            await update_progress_message(
+                update,
+                message_id,
+                f"❌ Ошибка при получении подписчиков: {e}",
+                100,
+                False
+            )
+        except Exception:
+            pass
+
+        # Удаляем из активных загрузок
+        if message_id in active_downloads:
+            del active_downloads[message_id]
+
+        return []
 
         # Используем dictionary для хранения уникальных пользователей
         unique_users = {}
@@ -341,7 +468,13 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                 for user in empty_search.users:
                     user_key = f"id{user.id}"
                     if user_key not in unique_users:
-                        # Сохраняем нужные поля пользователя
+                        # Получаем дополнительную информацию о пользователе
+                        full_info = await get_user_full_info(user)
+
+                        # Получаем дату присоединения к каналу
+                        join_date = await get_user_join_date(channel_peer, user.id)
+
+                        # Сохраняем все поля пользователя
                         unique_users[user_key] = {
                             'id': user.id,
                             'username': getattr(user, 'username', None),
@@ -350,11 +483,26 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                             'phone': getattr(user, 'phone', None),
                             'bot': getattr(user, 'bot', False),
                             'deleted': getattr(user, 'deleted', False),
-                            'premium': getattr(user, 'premium', False)
+                            'premium': getattr(user, 'premium', False),
+                            # Новые поля
+                            'bio': full_info['bio'],
+                            'is_scam': full_info['is_scam'],
+                            'is_fake': full_info['is_fake'],
+                            'status': full_info['status'],
+                            'last_active': full_info['last_active'],
+                            'language': full_info['language'],
+                            'join_date': join_date.isoformat() if join_date else None
                         }
 
-                # Проверка на отмену
-                if download_tracker["cancelled"]:
+                # Проверка на отмену 
+                if active_downloads[message_id]["cancelled"]:
+                    await update_progress_message(
+                        update,
+                        message_id,
+                        'Выгрузка отменена пользователем.',
+                        100,
+                        False
+                    )
                     del active_downloads[message_id]
                     return None
 
@@ -375,7 +523,14 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
             logger.error(f"Ошибка при поиске по пустой строке: {e}")
 
         # Проверка на отмену
-        if download_tracker["cancelled"]:
+        if active_downloads[message_id]["cancelled"]:
+            await update_progress_message(
+                update,
+                message_id,
+                'Выгрузка отменена пользователем.',
+                100,
+                False
+            )
             del active_downloads[message_id]
             return None
 
@@ -391,7 +546,14 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                 ))
 
                 # Проверка на отмену после каждого запроса
-                if download_tracker["cancelled"]:
+                if active_downloads[message_id]["cancelled"]:
+                    await update_progress_message(
+                        update,
+                        message_id,
+                        'Выгрузка отменена пользователем.',
+                        100,
+                        False
+                    )
                     del active_downloads[message_id]
                     return None
 
@@ -400,7 +562,14 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                     for user in result.users:
                         user_key = f"id{user.id}"
                         if user_key not in unique_users:
-                            unique_users[user_key] = {
+                            # Получаем дополнительную информацию о пользователе
+                            full_info = await get_user_full_info(user)
+
+                            # Получаем дату присоединения к каналу
+                            join_date = await get_user_join_date(channel_peer, user.id)
+
+                            # Сохраняем все поля пользователя
+                            user_data = {
                                 'id': user.id,
                                 'username': getattr(user, 'username', None),
                                 'firstName': getattr(user, 'first_name', None),
@@ -408,8 +577,17 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                                 'phone': getattr(user, 'phone', None),
                                 'bot': getattr(user, 'bot', False),
                                 'deleted': getattr(user, 'deleted', False),
-                                'premium': getattr(user, 'premium', False)
+                                'premium': getattr(user, 'premium', False),
+                                # Новые поля
+                                'bio': full_info['bio'],
+                                'is_scam': full_info['is_scam'],
+                                'is_fake': full_info['is_fake'],
+                                'join_date': join_date.isoformat() if join_date else None
                             }
+                            unique_users[user_key] = user_data
+
+                            # Также добавляем в список частичных данных
+                            download_tracker["partial_data"].append(user_data)
                     added_count = len(unique_users) - before_count
 
                     # Обновляем прогресс
@@ -452,7 +630,7 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                     True
                 )
 
-        # Основной цикл по алфавиту
+        # Основной цикл по алфавиту (подобный код)
         for letter in alphabet:
             try:
                 result = await client(GetParticipantsRequest(
@@ -473,6 +651,13 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                     for user in result.users:
                         user_key = f"id{user.id}"
                         if user_key not in unique_users:
+                            # Получаем дополнительную информацию о пользователе
+                            full_info = await get_user_full_info(user)
+
+                            # Получаем дату присоединения к каналу
+                            join_date = await get_user_join_date(channel_peer, user.id)
+
+                            # Сохраняем все поля пользователя
                             unique_users[user_key] = {
                                 'id': user.id,
                                 'username': getattr(user, 'username', None),
@@ -481,7 +666,15 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                                 'phone': getattr(user, 'phone', None),
                                 'bot': getattr(user, 'bot', False),
                                 'deleted': getattr(user, 'deleted', False),
-                                'premium': getattr(user, 'premium', False)
+                                'premium': getattr(user, 'premium', False),
+                                # Новые поля
+                                'bio': full_info['bio'],
+                                'is_scam': full_info['is_scam'],
+                                'is_fake': full_info['is_fake'],
+                                'status': full_info['status'],
+                                'last_active': full_info['last_active'],
+                                'language': full_info['language'],
+                                'join_date': join_date.isoformat() if join_date else None
                             }
                     added_count = len(unique_users) - before_count
 
@@ -525,94 +718,6 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                     True
                 )
 
-        # Проверка на отмену
-        if download_tracker["cancelled"]:
-            del active_downloads[message_id]
-            return None
-
-        # Дополнительные фильтры для малого количества участников
-        if len(unique_users) < 200:
-            try:
-                # Администраторы
-                admins = await client(GetParticipantsRequest(
-                    channel=channel_peer,
-                    filter=ChannelParticipantsAdmins(),
-                    offset=0,
-                    limit=200,
-                    hash=0
-                ))
-
-                # Проверка на отмену
-                if download_tracker["cancelled"]:
-                    del active_downloads[message_id]
-                    return None
-
-                if admins and admins.users:
-                    before_count = len(unique_users)
-                    for user in admins.users:
-                        user_key = f"id{user.id}"
-                        if user_key not in unique_users:
-                            unique_users[user_key] = {
-                                'id': user.id,
-                                'username': getattr(user, 'username', None),
-                                'firstName': getattr(user, 'first_name', None),
-                                'lastName': getattr(user, 'last_name', None),
-                                'phone': getattr(user, 'phone', None),
-                                'bot': getattr(user, 'bot', False),
-                                'deleted': getattr(user, 'deleted', False),
-                                'premium': getattr(user, 'premium', False)
-                            }
-                    added_count = len(unique_users) - before_count
-
-                    await update_progress_message(
-                        update,
-                        message_id,
-                        f"Получение подписчиков: поиск администраторов добавил {added_count} новых участников. Всего: {len(unique_users)}",
-                        95,
-                        True
-                    )
-
-                # Боты
-                bots = await client(GetParticipantsRequest(
-                    channel=channel_peer,
-                    filter=ChannelParticipantsBots(),
-                    offset=0,
-                    limit=200,
-                    hash=0
-                ))
-
-                # Проверка на отмену
-                if download_tracker["cancelled"]:
-                    del active_downloads[message_id]
-                    return None
-
-                if bots and bots.users:
-                    before_count = len(unique_users)
-                    for user in bots.users:
-                        user_key = f"id{user.id}"
-                        if user_key not in unique_users:
-                            unique_users[user_key] = {
-                                'id': user.id,
-                                'username': getattr(user, 'username', None),
-                                'firstName': getattr(user, 'first_name', None),
-                                'lastName': getattr(user, 'last_name', None),
-                                'phone': getattr(user, 'phone', None),
-                                'bot': getattr(user, 'bot', False),
-                                'deleted': getattr(user, 'deleted', False),
-                                'premium': getattr(user, 'premium', False)
-                            }
-                    added_count = len(unique_users) - before_count
-
-                    await update_progress_message(
-                        update,
-                        message_id,
-                        f"Получение подписчиков: поиск ботов добавил {added_count} новых участников. Всего: {len(unique_users)}",
-                        98,
-                        True
-                    )
-            except Exception as e:
-                logger.error(f"Ошибка при получении дополнительных участников: {e}")
-
         # Завершающее сообщение (уже без кнопки отмены)
         await update_progress_message(
             update,
@@ -644,12 +749,64 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
 
         return []
 
-def cancel_download(message_id: int) -> bool:
-    """Отмена процесса выгрузки"""
+async def cancel_download(message_id: int) -> bool:
+    """Отмена процесса выгрузки - реальное прерывание процесса"""
     if message_id in active_downloads:
+        logger.info(f"Запрос отмены выгрузки для message_id {message_id}")
         active_downloads[message_id]["cancelled"] = True
+
+        # Принудительно завершить все связанные задачи
+        cancelled = False
+        for task in asyncio.all_tasks():
+            task_name = task.get_name()
+            if task_name.startswith(f"download_{message_id}"):
+                logger.info(f"Отмена задачи с именем {task_name}")
+                task.cancel()
+                cancelled = True
+
+        # Даже если задача не найдена, устанавливаем флаг отмены
         return True
     return False
+
+async def export_partial_data(update: Update, message_id: int, channel_title: str) -> bool:
+    """Экспорт частично полученных данных при отмене выгрузки"""
+    if message_id not in active_downloads or not active_downloads[message_id].get("partial_data"):
+        return False
+
+    # Получаем собранные данные
+    partial_subscribers = active_downloads[message_id]["partial_data"]
+
+    if not partial_subscribers:
+        return False
+
+    # Создаем CSV с частичными данными
+    csv_result = create_subscribers_csv(partial_subscribers, f"{channel_title}_partial")
+
+    if not csv_result:
+        return False
+
+    # Отправляем файл
+    with open(csv_result["filePath"], 'rb') as file:
+        await update.effective_chat.send_document(
+            document=file,
+            filename=csv_result["fileName"],
+            caption=f"Частичный список ({csv_result['count']} обработанных)"
+        )
+
+    # Удаляем файл после отправки
+    if os.path.exists(csv_result["filePath"]):
+        os.remove(csv_result["filePath"])
+
+    # Сообщаем, что отправили частичные данные
+    await update.callback_query.edit_message_text(
+        f"✅ Отправлен CSV с {csv_result['count']} пользователями",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Список каналов", callback_data="channels_list")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
+        ])
+    )
+
+    return True
 
 def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[str, Any]:
     """Создание CSV файла с подписчиками"""
@@ -672,7 +829,11 @@ def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[
         with open(file_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
             # Заголовок CSV
-            writer.writerow(['ID', 'Username', 'First Name', 'Last Name', 'Phone', 'Bot', 'Deleted', 'Premium'])
+            writer.writerow([
+                'ID', 'Username', 'First Name', 'Last Name', 'Phone', 'Bot', 'Deleted', 'Premium',
+                # Новые поля
+                'Bio', 'Scam', 'Fake', 'Join Date'
+            ])
 
             # Данные пользователей
             for user in subscribers:
@@ -684,7 +845,12 @@ def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[
                     user.get('phone', ''),
                     'Да' if user.get('bot', False) else 'Нет',
                     'Да' if user.get('deleted', False) else 'Нет',
-                    'Да' if user.get('premium', False) else 'Нет'
+                    'Да' if user.get('premium', False) else 'Нет',
+                    # Новые поля 
+                    user.get('bio', '') or '',
+                    'Да' if user.get('is_scam', False) else 'Нет',
+                    'Да' if user.get('is_fake', False) else 'Нет',
+                    user.get('join_date', '') or ''
                 ])
 
         logger.info(f"CSV файл создан: {file_name}")
@@ -717,7 +883,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
 
     await update.message.reply_text(
-        'GhostList v1.2.0 "Unique Subscribers" активирован! 🤖\n\n'
+        'GhostList v1.2.0 активирован! 🤖\n\n'
         'Я могу помочь вам выгрузить список подписчиков из каналов, где я являюсь администратором.\n\n'
         'Доступные команды:\n'
         '/channels - Показать список добавленных каналов\n'
@@ -736,10 +902,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
 
     await update.message.reply_text(
-        '*GhostList v1.2.0 "Unique Subscribers" - Помощь*\n\n'
+        '*GhostList v1.2.0 - Помощь*\n\n'
         '*Команды:*\n'
         '/start - Начать работу с ботом\n'
-        '/channels - Показать список добавленных каналов\n'
+        '/channels - Показать список каналов\n'
         '/addchannel - Добавить канал (формат: /addchannel @username или /addchannel -100123456789)\n'
         '/removechannel - Удалить канал из списка\n'
         '/help - Показать это сообщение\n\n'
@@ -749,7 +915,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         '3. Используйте команду /channels\n'
         '4. Выберите канал из списка\n'
         '5. Дождитесь выгрузки CSV файла с подписчиками\n\n'
-        '*Примечание:* Вы можете прервать процесс выгрузки в любой момент, нажав кнопку "Отменить выгрузку"',
+        '*Функции:*\n'
+        '• Расширенная информация: биография, дата вступления и др.\n'
+        '• Кнопка "Отменить" — полная остановка выгрузки',
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -878,6 +1046,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("У вас нет прав для использования этой функции.", show_alert=True)
             return
 
+    # Логирование запроса для отладки
+    logger.info(f"Получен callback query: {data} от пользователя {user_id}, message_id={message_id}")
+
     # Обработка различных колбеков
     if data == "back_to_main":
         # Возврат в главное меню
@@ -888,7 +1059,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ]
 
         await query.edit_message_text(
-            'GhostList v1.2.0 "Unique Subscribers" активирован! 🤖\n\n'
+            'GhostList v1.2.0 активирован! 🤖\n\n'
             'Выберите действие из меню ниже:',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -977,21 +1148,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Обработка отмены выгрузки
     elif data.startswith("cancel_download_"):
         target_message_id = int(data.split("_")[2])
+        logger.info(f"Запрос на отмену выгрузки, message_id={target_message_id}")
 
-        if cancel_download(target_message_id):
-            # Если отмена прошла успешно
+        try:
+            cancel_result = await cancel_download(target_message_id)
+            logger.info(f"Результат отмены: {cancel_result}")
+
+            # Сообщаем пользователю о результате
             await query.edit_message_text(
-                '❌ Выгрузка подписчиков отменена пользователем.',
+                '❌ Выгрузка отменена. Возвращаемся в главное меню...',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📋 Список каналов", callback_data="channels_list")],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
                 ])
             )
-        else:
-            # Если нечего отменять
+        except Exception as e:
+            logger.error(f"Ошибка при отмене выгрузки: {e}")
             await query.edit_message_text(
-                'Нет активной выгрузки для отмены.',
+                f'Произошла ошибка при отмене выгрузки: {e}',
                 reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
+                ])
+            )
+
+    # Обработка выгрузки частичных данных 
+    elif data.startswith("export_partial_"):
+        target_message_id = int(data.split("_")[2])
+
+        # Получаем информацию о канале для формирования имени файла
+        channel_title = "Channel"
+        try:
+            # Попытка получить название канала через peer
+            if "channel_peer" in active_downloads[target_message_id]:
+                channel_peer = active_downloads[target_message_id]["channel_peer"]
+                channel_info = await client(GetFullChannelRequest(channel=channel_peer))
+                if hasattr(channel_info, 'chats') and channel_info.chats:
+                    channel_title = channel_info.chats[0].title
+        except Exception as e:
+            logger.error(f"Ошибка при получении названия канала: {e}")
+
+        # Выгружаем частичные данные
+        success = await export_partial_data(update, target_message_id, channel_title)
+
+        if not success:
+            await query.edit_message_text(
+                'Нет данных для выгрузки.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Каналы", callback_data="channels_list")],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
                 ])
             )
@@ -1182,7 +1385,8 @@ async def process_channel_selection(update: Update, channel_id: str) -> None:
     try:
         # Обновляем сообщение
         await query.edit_message_text(
-            'Получение списка подписчиков... Это может занять некоторое время.'
+            'Получение списка подписчиков... Это может занять некоторое время. '
+            'Собираем информацию о пользователях (биография, дата присоединения и др.).'
         )
 
         # Получаем информацию о канале из нашего списка
@@ -1298,7 +1502,8 @@ async def process_channel_selection(update: Update, channel_id: str) -> None:
             await update.effective_chat.send_document(
                 document=file,
                 filename=csv_result["fileName"],
-                caption=f"Список подписчиков канала \"{channel_title}\" ({csv_result['count']} уникальных пользователей)"
+                caption=f"Список подписчиков канала \"{channel_title}\" ({csv_result['count']})\n"
+                        f"Включена информация: биография, дата вступления и метки scam/fake."
             )
 
         # Удаляем файл после отправки
@@ -1330,7 +1535,7 @@ async def main() -> None:
     """Запуск бота"""
     global client
 
-    logger.info('GhostList v1.2.0 "Unique Subscribers" запускается...')
+    logger.info('GhostList v1.2.0 запускается...')
 
     # Создаем папку для данных, если она не существует
     if not os.path.exists(DATA_DIR):
