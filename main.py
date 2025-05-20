@@ -76,33 +76,56 @@ async def add_channel(channel_identifier: str) -> Dict[str, Any]:
         logger.info(f"Проверка канала: {channel_identifier}")
 
         # Получаем информацию о канале
-        entity = await client.get_entity(channel_identifier)
+        try:
+            entity = await client.get_entity(channel_identifier)
+            logger.info(f"Получена информация о канале: {entity}")
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о канале: {e}")
+            return {
+                "success": False,
+                "error": f"Не удалось найти канал. Причина: {str(e)}"
+            }
 
         # Проверяем, что это канал
         if not hasattr(entity, 'megagroup') and not hasattr(entity, 'broadcast'):
+            logger.error(f"Найденная сущность не является каналом: {entity}")
             return {"success": False, "error": "Указанный идентификатор не является каналом"}
 
         logger.info(f"Найден канал: {entity.title} (ID: {entity.id})")
 
         # Получаем информацию о боте
         me = await client.get_me()
+        logger.info(f"Информация о боте: {me.id}")
 
         # Проверяем права бота в канале
         try:
-            admin_rights = await client(GetParticipantRequest(
-                channel=entity,
-                participant=me.id
-            ))
+            # Для более надежной проверки запросим полную информацию о канале
+            full_channel = await client(GetFullChannelRequest(channel=entity))
 
-            is_admin = isinstance(admin_rights.participant, (
-                type(ChannelParticipantsAdmins.CONSTRUCTOR_ID),
-                type(ChannelParticipantsBots.CONSTRUCTOR_ID)
-            ))
+            # Проверим, является ли бот администратором
+            try:
+                admin_rights = await client(GetParticipantRequest(
+                    channel=entity,
+                    participant=me.id
+                ))
 
-            if not is_admin:
+                logger.info(f"Права бота в канале: {admin_rights.participant}")
+
+                # Проходит любой администратор или бот
+                participant_type = type(admin_rights.participant).__name__
+                is_admin = 'Admin' in participant_type or 'Creator' in participant_type
+
+                if not is_admin:
+                    logger.error(f"Бот не имеет прав администратора, тип: {participant_type}")
+                    return {
+                        "success": False,
+                        "error": "Бот не является администратором канала. Добавьте бота администратором канала и попробуйте снова."
+                    }
+            except Exception as admin_error:
+                logger.error(f"Ошибка проверки прав администратора: {admin_error}")
                 return {
                     "success": False,
-                    "error": "Бот не является администратором канала. Добавьте бота администратором канала и попробуйте снова."
+                    "error": f"Не удалось проверить права бота в канале. Убедитесь, что бот добавлен как администратор: {str(admin_error)}"
                 }
 
             # Загружаем текущий список каналов
@@ -121,13 +144,16 @@ async def add_channel(channel_identifier: str) -> Dict[str, Any]:
                 return {"success": False, "error": "Этот канал уже добавлен в список"}
 
             # Добавляем канал в список с accessHash
-            channels.append({
+            channel_data = {
                 "id": str(entity.id),
                 "title": entity.title,
                 "username": getattr(entity, 'username', None) or 'Приватный канал',
                 "accessHash": str(entity.access_hash) if hasattr(entity, 'access_hash') else None,
                 "addedAt": datetime.now().isoformat()
-            })
+            }
+            logger.info(f"Добавление канала в список: {channel_data}")
+
+            channels.append(channel_data)
 
             # Сохраняем обновленный список
             save_channels(channels)
@@ -141,16 +167,16 @@ async def add_channel(channel_identifier: str) -> Dict[str, Any]:
                 }
             }
         except Exception as e:
-            logger.error(f"Ошибка проверки прав: {e}")
+            logger.error(f"Ошибка проверки прав или сохранения канала: {e}")
             return {
                 "success": False,
-                "error": "Ошибка проверки прав. Проверьте, что бот добавлен как администратор канала."
+                "error": f"Ошибка проверки прав. Проверьте, что бот добавлен как администратор канала: {str(e)}"
             }
     except Exception as e:
         logger.error(f"Ошибка добавления канала: {e}")
         return {
             "success": False,
-            "error": "Не удалось найти канал. Убедитесь, что ID/username канала правильный."
+            "error": f"Не удалось добавить канал. Подробности: {str(e)}"
         }
 
 def remove_channel(channel_id: str) -> Dict[str, Any]:
@@ -691,7 +717,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
 
     await update.message.reply_text(
-        'NullifierCore v1.2.0 "Unique Subscribers" активирован! 🤖\n\n'
+        'GhostList v1.2.0 "Unique Subscribers" активирован! 🤖\n\n'
         'Я могу помочь вам выгрузить список подписчиков из каналов, где я являюсь администратором.\n\n'
         'Доступные команды:\n'
         '/channels - Показать список добавленных каналов\n'
@@ -710,7 +736,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
 
     await update.message.reply_text(
-        '*NullifierCore v1.2.0 "Unique Subscribers" - Помощь*\n\n'
+        '*GhostList v1.2.0 "Unique Subscribers" - Помощь*\n\n'
         '*Команды:*\n'
         '/start - Начать работу с ботом\n'
         '/channels - Показать список добавленных каналов\n'
@@ -862,7 +888,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ]
 
         await query.edit_message_text(
-            'NullifierCore v1.2.0 "Unique Subscribers" активирован! 🤖\n\n'
+            'GhostList v1.2.0 "Unique Subscribers" активирован! 🤖\n\n'
             'Выберите действие из меню ниже:',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -1304,7 +1330,7 @@ async def main() -> None:
     """Запуск бота"""
     global client
 
-    logger.info('NullifierCore v1.2.0 "Unique Subscribers" запускается...')
+    logger.info('GhostList v1.2.0 "Unique Subscribers" запускается...')
 
     # Создаем папку для данных, если она не существует
     if not os.path.exists(DATA_DIR):
@@ -1340,6 +1366,23 @@ async def main() -> None:
     # Обработчик колбеков от кнопок
     application.add_handler(CallbackQueryHandler(handle_callback))
 
+    # Настраиваем команды для меню бота
+    bot_commands = [
+        ("start", "Начать работу с ботом"),
+        ("channels", "Показать список добавленных каналов"),
+        ("addchannel", "Добавить канал"),
+        ("removechannel", "Удалить канал из списка"),
+        ("help", "Показать справку"),
+        ("cancel", "Отменить текущую операцию")
+    ]
+
+    # Устанавливаем команды для BotFather
+    try:
+        await application.bot.set_my_commands(bot_commands)
+        logger.info("Команды бота установлены в меню")
+    except Exception as e:
+        logger.error(f"Ошибка при установке команд бота: {e}")
+
     # Запуск бота в режиме long polling
     logger.info("Запуск бота...")
 
@@ -1348,7 +1391,7 @@ async def main() -> None:
     await application.start()
     await application.updater.start_polling()
 
-    logger.info("NullifierCore готов к работе!")
+    logger.info("GhostList готов к работе!")
 
     # Важно: ожидаем сигнал остановки вместо завершения функции
     # Это позволяет боту работать бесконечно

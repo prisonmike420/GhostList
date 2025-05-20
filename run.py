@@ -20,7 +20,7 @@ if not os.path.exists(DATA_DIR):
 
 async def run_application():
     """Основная функция для запуска приложения"""
-    logger.info('NullifierCore v1.2.0 "Unique Subscribers" запускается...')
+    logger.info('GhostList v1.2.0 "Unique Subscribers" запускается...')
 
     # Запуск HTTP-сервера
     runner = await start_server()
