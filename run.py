@@ -26,19 +26,23 @@ async def run_application():
     runner = await start_server()
 
     try:
-        # Импортируем main только здесь, чтобы избежать циклических импортов
+        # Импортируем main только здесь
         from main import main as run_bot
 
-        # Запускаем бота и ждем его завершения
-        await run_bot()
+        # Запускаем бота и ждем сигнала завершения
+        main_task = asyncio.create_task(run_bot())
 
-        # Поддерживаем работу приложения
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        logger.info("Получен сигнал отмены, завершаем работу...")
-    except KeyboardInterrupt:
-        logger.info("Получен сигнал прерывания, завершаем работу...")
+        # Ждем завершения задачи или внешнего сигнала отмены
+        try:
+            await main_task
+        except asyncio.CancelledError:
+            logger.info("Получен сигнал отмены")
+            main_task.cancel()
+            try:
+                await main_task
+            except asyncio.CancelledError:
+                pass
+
     except Exception as e:
         logger.error(f"Ошибка при работе бота: {e}")
     finally:
@@ -47,7 +51,7 @@ async def run_application():
 
 if __name__ == "__main__":
     try:
-        # В Replit используем запуск через asyncio.run()
+        # Используем asyncio.run для запуска основной функции
         asyncio.run(run_application())
     except KeyboardInterrupt:
         logger.info("Завершение работы NullifierCore...")

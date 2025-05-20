@@ -1340,27 +1340,32 @@ async def main() -> None:
     # Обработчик колбеков от кнопок
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Запускаем бота в режиме long polling
+    # Запуск бота в режиме long polling
+    logger.info("Запуск бота...")
+
+    # Запускаем бота и ждем его завершения
     await application.initialize()
-    await application.updater.start_polling(
-        poll_interval=0.5,
-        timeout=10,
-        bootstrap_retries=-1,
-        read_timeout=15,
-        write_timeout=15,
-        connect_timeout=15
-    )
+    await application.start()
+    await application.updater.start_polling()
 
     logger.info("NullifierCore готов к работе!")
 
+    # Важно: ожидаем сигнал остановки вместо завершения функции
+    # Это позволяет боту работать бесконечно
+    stop_signal = asyncio.Future()
+
     try:
-        # Ждем сигнала остановки
-        await application.updater.stop_on_signal()
+        # Ожидаем отмены или завершения бота
+        await stop_signal
+    except asyncio.CancelledError:
+        # Корректная остановка приложения
+        logger.info("Получен сигнал остановки...")
+
     finally:
-        # Закрываем клиент MTProto при выходе
-        await client.disconnect()
+        # Остановка приложения
         await application.stop()
-        logger.info("Бот остановлен")
+        # Закрываем клиент MTProto
+        await client.disconnect()
 
 if __name__ == "__main__":
     try:
