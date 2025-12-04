@@ -315,13 +315,85 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
             del active_downloads[message_id]
             return []
 
+        last_update_time = datetime.now()
+        
+        # ============ МЕТОД 1: iter_participants (автоматическая пагинация) ============
+        logger.info("Метод 1: Получение через iter_participants...")
+        try:
+            user_count = 0
+            async for user in client.iter_participants(channel_peer, aggressive=True):
+                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                    break
+                    
+                user_key = f"id{user.id}"
+                if user_key not in unique_users:
+                    try:
+                        user_status = "Unknown"
+                        if hasattr(user, 'status'):
+                            status = user.status
+                            if status:
+                                status_name = type(status).__name__
+                                if status_name == 'UserStatusOnline':
+                                    user_status = 'Online'
+                                elif status_name == 'UserStatusOffline':
+                                    user_status = 'Offline'
+                                elif status_name == 'UserStatusRecently':
+                                    user_status = 'Recently'
+                                elif status_name == 'UserStatusLastWeek':
+                                    user_status = 'Last Week'
+                                elif status_name == 'UserStatusLastMonth':
+                                    user_status = 'Last Month'
+                                elif status_name == 'UserStatusEmpty':
+                                    user_status = 'Empty'
+                                else:
+                                    user_status = status_name
+                        user_data = {
+                            'id': user.id,
+                            'username': getattr(user, 'username', None),
+                            'firstName': getattr(user, 'first_name', None),
+                            'lastName': getattr(user, 'last_name', None),
+                            'phone': getattr(user, 'phone', None),
+                            'bot': getattr(user, 'bot', False),
+                            'deleted': getattr(user, 'deleted', False),
+                            'premium': getattr(user, 'premium', False),
+                            'verified': getattr(user, 'verified', False),
+                            'restricted': getattr(user, 'restricted', False),
+                            'lang_code': getattr(user, 'lang_code', None),
+                            'status': user_status,
+                            'bio': None,
+                            'is_scam': getattr(user, 'scam', False),
+                            'is_fake': getattr(user, 'fake', False),
+                            'join_date': None
+                        }
+                        unique_users[user_key] = user_data
+                        if message_id in active_downloads:
+                            active_downloads[message_id]["partial_data"].append(user_data)
+                        user_count += 1
+                        
+                        # Обновляем прогресс каждые 500 пользователей или каждые 3 секунды
+                        if user_count % 500 == 0 or (datetime.now() - last_update_time).total_seconds() > 3:
+                            progress = min(45, int(user_count / max(participants_count, 1) * 45))
+                            await update_progress_message(update, message_id,
+                                f"Метод 1: Получено {len(unique_users)} пользователей...\n"
+                                f"Всего в канале: {participants_count}",
+                                progress, True)
+                            last_update_time = datetime.now()
+                    except Exception as e:
+                        logger.error(f"Ошибка обработки пользователя: {e}")
+            
+            logger.info(f"После iter_participants: {len(unique_users)} пользователей")
+        except Exception as e:
+            logger.error(f"Ошибка iter_participants: {e}")
+        
+        # ============ МЕТОД 2: Алфавитный поиск для дополнительных пользователей ============
+        logger.info("Метод 2: Алфавитный поиск...")
+        
         # Расширенный набор поисковых запросов
-        # Латиница, кириллица, цифры, специальные символы
         single_chars = [''] + list('abcdefghijklmnopqrstuvwxyz') + list('абвгдеёжзийклмнопрстуфхцчшщъыьэюя') + list('0123456789')
         
-        # Двухбуквенные комбинации для популярных букв (увеличивает охват)
-        common_ru_letters = 'аеиокнсмтв'
-        common_en_letters = 'aeiosmtnr'
+        # Двухбуквенные комбинации для популярных букв
+        common_ru_letters = 'аеиокнсмтвпр'
+        common_en_letters = 'aeiosmtnrld'
         two_letter_combos = []
         for c1 in common_ru_letters:
             for c2 in 'аеиоу':
@@ -330,90 +402,16 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
             for c2 in 'aeiou':
                 two_letter_combos.append(c1 + c2)
         
-        # Специальные символы и эмодзи-префиксы
+        # Специальные символы
         special_chars = list('._-@#$%&*!?')
         
         search_queries = single_chars + two_letter_combos + special_chars
+        total_searches = len(search_queries)
         
-        processed_count = 0
-        last_update_time = datetime.now()
-        total_searches = len(search_queries) + 2  # +2 для ChannelParticipantsRecent и Admins
-        
-        logger.info(f"Начинаем расширенный поиск подписчиков по {total_searches} запросам...")
-        
-        # Сначала получаем недавних участников (отдельный фильтр)
-        try:
-            logger.info("Получение недавних участников...")
-            offset = 0
-            while True:
-                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
-                    break
-                try:
-                    participants = await client(GetParticipantsRequest(
-                        channel=channel_peer,
-                        filter=ChannelParticipantsRecent(),
-                        offset=offset,
-                        limit=200,
-                        hash=0
-                    ))
-                    if not participants.users:
-                        break
-                    for user in participants.users:
-                        user_key = f"id{user.id}"
-                        if user_key not in unique_users:
-                            try:
-                                user_status = "Unknown"
-                                if hasattr(user, 'status'):
-                                    status = user.status
-                                    if status:
-                                        status_name = type(status).__name__
-                                        if status_name == 'UserStatusOnline':
-                                            user_status = 'Online'
-                                        elif status_name == 'UserStatusOffline':
-                                            user_status = 'Offline'
-                                        elif status_name == 'UserStatusRecently':
-                                            user_status = 'Recently'
-                                        elif status_name == 'UserStatusLastWeek':
-                                            user_status = 'Last Week'
-                                        elif status_name == 'UserStatusLastMonth':
-                                            user_status = 'Last Month'
-                                        elif status_name == 'UserStatusEmpty':
-                                            user_status = 'Empty'
-                                        else:
-                                            user_status = status_name
-                                user_data = {
-                                    'id': user.id,
-                                    'username': getattr(user, 'username', None),
-                                    'firstName': getattr(user, 'first_name', None),
-                                    'lastName': getattr(user, 'last_name', None),
-                                    'phone': getattr(user, 'phone', None),
-                                    'bot': getattr(user, 'bot', False),
-                                    'deleted': getattr(user, 'deleted', False),
-                                    'premium': getattr(user, 'premium', False),
-                                    'verified': getattr(user, 'verified', False),
-                                    'restricted': getattr(user, 'restricted', False),
-                                    'lang_code': getattr(user, 'lang_code', None),
-                                    'status': user_status,
-                                    'bio': None,
-                                    'is_scam': getattr(user, 'scam', False),
-                                    'is_fake': getattr(user, 'fake', False),
-                                    'join_date': None
-                                }
-                                unique_users[user_key] = user_data
-                                if message_id in active_downloads:
-                                    active_downloads[message_id]["partial_data"].append(user_data)
-                            except Exception as e:
-                                logger.error(f"Ошибка обработки пользователя: {e}")
-                    offset += len(participants.users)
-                    if len(participants.users) < 200:
-                        break
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    logger.error(f"Ошибка получения недавних участников: {e}")
-                    break
-            logger.info(f"После ChannelParticipantsRecent: {len(unique_users)} пользователей")
-        except Exception as e:
-            logger.error(f"Ошибка при получении недавних участников: {e}")
+        await update_progress_message(update, message_id,
+            f"Метод 2: Алфавитный поиск ({total_searches} запросов)...\n"
+            f"Уже найдено: {len(unique_users)} пользователей",
+            50, True)
         
         try:
             for search_idx, search_char in enumerate(search_queries):
@@ -445,9 +443,6 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                             user_key = f"id{user.id}"
                             if user_key not in unique_users:
                                 try:
-                                    full_info = await get_user_full_info(user)
-                                    join_date = await get_user_join_date(channel_peer, user.id)
-
                                     # Определяем статус пользователя
                                     user_status = "Unknown"
                                     if hasattr(user, 'status'):
@@ -482,17 +477,15 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                                         'restricted': getattr(user, 'restricted', False),
                                         'lang_code': getattr(user, 'lang_code', None),
                                         'status': user_status,
-                                        'bio': full_info['bio'],
-                                        'is_scam': full_info['is_scam'],
-                                        'is_fake': full_info['is_fake'],
-                                        'join_date': join_date.isoformat() if join_date else None
+                                        'bio': None,
+                                        'is_scam': getattr(user, 'scam', False),
+                                        'is_fake': getattr(user, 'fake', False),
+                                        'join_date': None
                                     }
                                     unique_users[user_key] = user_data
 
                                     if message_id in active_downloads:
                                         active_downloads[message_id]["partial_data"].append(user_data)
-                                    
-                                    processed_count += 1
 
                                 except Exception as user_error:
                                     logger.error(f"Ошибка при обработке пользователя {user.id}: {user_error}")
@@ -512,12 +505,12 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                 
                 # Обновляем прогресс после каждого символа поиска
                 if (datetime.now() - last_update_time).total_seconds() > 2:
-                    search_progress = int((search_idx + 1) / total_searches * 90) + 5
+                    search_progress = 50 + int((search_idx + 1) / total_searches * 45)
                     await update_progress_message(update, message_id,
-                        f"Обработано пользователей: {len(unique_users)}\n"
+                        f"Метод 2: Найдено {len(unique_users)} пользователей\n"
                         f"Поиск: {search_idx + 1}/{total_searches}\n"
-                        f"Всего в канале (примерно): {participants_count}",
-                        min(99, search_progress), True)
+                        f"Всего в канале: {participants_count}",
+                        min(95, search_progress), True)
                     last_update_time = datetime.now()
                 
                 # Небольшая задержка между поисками
