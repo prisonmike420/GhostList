@@ -37,15 +37,28 @@ API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH', '')
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 
+# Загрузка списка разрешённых пользователей из переменной окружения
+ALLOWED_USER_IDS_STR = os.environ.get('ALLOWED_USER_IDS', '')
+ALLOWED_USER_IDS: List[int] = []
+if ALLOWED_USER_IDS_STR:
+    try:
+        ALLOWED_USER_IDS = [int(uid.strip()) for uid in ALLOWED_USER_IDS_STR.split(',') if uid.strip()]
+        logger.info(f"Загружено {len(ALLOWED_USER_IDS)} разрешённых пользователей")
+    except ValueError as e:
+        logger.error(f"Ошибка при парсинге ALLOWED_USER_IDS: {e}")
+        raise ValueError('ALLOWED_USER_IDS должен содержать ID пользователей через запятую (например: 123456789,987654321)')
+
 # Проверка наличия всех необходимых переменных
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError('Отсутствуют необходимые настройки! Убедитесь, что вы добавили API_ID, API_HASH и TELEGRAM_BOT_TOKEN.')
+
+if not ALLOWED_USER_IDS:
+    logger.warning('⚠️ ALLOWED_USER_IDS не установлен! Бот будет доступен всем пользователям.')
 
 # Константы
 DATA_DIR = os.path.join(os.getcwd(), 'data')
 CHANNELS_FILE = os.path.join(DATA_DIR, 'channels.json')
 SESSION_PATH = os.path.join(DATA_DIR, 'bot_session.session')
-ADMIN_IDS: List[int] = []  # ID администраторов бота
 active_downloads: Dict[int, Dict] = {}  # Для отслеживания активных выгрузок
 user_contexts: Dict[int, Dict] = {}  # Контексты пользователей
 
@@ -54,6 +67,14 @@ client = None  # Будет инициализирован позже
 
 
 # === Вспомогательные функции ===
+
+def is_user_allowed(user_id: int) -> bool:
+    """Проверка, разрешён ли доступ пользователю"""
+    # Если список разрешённых пользователей пуст, разрешаем всем
+    if not ALLOWED_USER_IDS:
+        return True
+    return user_id in ALLOWED_USER_IDS
+
 
 async def get_user_full_info(user) -> Dict[str, Any]:
     """Получение полной информации о пользователе"""
@@ -294,46 +315,80 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
             return []
 
         # Поиск подписчиков
+        processed_count = 0
+        last_update_time = datetime.now()
+        
         try:
-            result = await client(GetParticipantsRequest(
-                channel=channel_peer,
-                filter=ChannelParticipantsSearch(''),
-                offset=0,
-                limit=200,
-                hash=0
-            ))
+            async for user in client.iter_participants(channel_peer):
+                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                    break
 
-            if result and result.users:
-                for user in result.users:
-                    if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
-                        break
+                user_key = f"id{user.id}"
+                if user_key not in unique_users:
+                    try:
+                        full_info = await get_user_full_info(user)
+                        join_date = await get_user_join_date(channel_peer, user.id)
 
-                    user_key = f"id{user.id}"
-                    if user_key not in unique_users:
-                        try:
-                            full_info = await get_user_full_info(user)
-                            join_date = await get_user_join_date(channel_peer, user.id)
+                        # Определяем статус пользователя
+                        user_status = "Unknown"
+                        if hasattr(user, 'status'):
+                            status = user.status
+                            if status:
+                                status_name = type(status).__name__
+                                if status_name == 'UserStatusOnline':
+                                    user_status = 'Online'
+                                elif status_name == 'UserStatusOffline':
+                                    user_status = 'Offline'
+                                elif status_name == 'UserStatusRecently':
+                                    user_status = 'Recently'
+                                elif status_name == 'UserStatusLastWeek':
+                                    user_status = 'Last Week'
+                                elif status_name == 'UserStatusLastMonth':
+                                    user_status = 'Last Month'
+                                elif status_name == 'UserStatusEmpty':
+                                    user_status = 'Empty'
+                                else:
+                                    user_status = status_name
 
-                            user_data = {
-                                'id': user.id,
-                                'username': getattr(user, 'username', None),
-                                'firstName': getattr(user, 'first_name', None),
-                                'lastName': getattr(user, 'last_name', None),
-                                'phone': getattr(user, 'phone', None),
-                                'bot': getattr(user, 'bot', False),
-                                'deleted': getattr(user, 'deleted', False),
-                                'premium': getattr(user, 'premium', False),
-                                'bio': full_info['bio'],
-                                'is_scam': full_info['is_scam'],
-                                'is_fake': full_info['is_fake'],
-                                'join_date': join_date.isoformat() if join_date else None
-                            }
-                            unique_users[user_key] = user_data
+                        user_data = {
+                            'id': user.id,
+                            'username': getattr(user, 'username', None),
+                            'firstName': getattr(user, 'first_name', None),
+                            'lastName': getattr(user, 'last_name', None),
+                            'phone': getattr(user, 'phone', None),
+                            'bot': getattr(user, 'bot', False),
+                            'deleted': getattr(user, 'deleted', False),
+                            'premium': getattr(user, 'premium', False),
+                            'verified': getattr(user, 'verified', False),
+                            'restricted': getattr(user, 'restricted', False),
+                            'lang_code': getattr(user, 'lang_code', None),
+                            'status': user_status,
+                            'bio': full_info['bio'],
+                            'is_scam': full_info['is_scam'],
+                            'is_fake': full_info['is_fake'],
+                            'join_date': join_date.isoformat() if join_date else None
+                        }
+                        unique_users[user_key] = user_data
 
-                            if message_id in active_downloads:
-                                active_downloads[message_id]["partial_data"].append(user_data)
-                        except Exception as user_error:
-                            logger.error(f"Ошибка при обработке пользователя {user.id}: {user_error}")
+                        if message_id in active_downloads:
+                            active_downloads[message_id]["partial_data"].append(user_data)
+                        
+                        processed_count += 1
+                        
+                        # Обновляем прогресс каждые 50 пользователей или раз в 3 секунды
+                        if processed_count % 50 == 0 or (datetime.now() - last_update_time).total_seconds() > 3:
+                            current_percent = 0
+                            if participants_count > 0:
+                                current_percent = min(99, int((processed_count / participants_count) * 100))
+                            
+                            await update_progress_message(update, message_id,
+                                f"Обработано пользователей: {processed_count}\n"
+                                f"Всего в канале (примерно): {participants_count}",
+                                current_percent, True)
+                            last_update_time = datetime.now()
+
+                    except Exception as user_error:
+                        logger.error(f"Ошибка при обработке пользователя {user.id}: {user_error}")
         except Exception as e:
             logger.error(f"Ошибка при получении подписчиков: {e}")
 
@@ -434,7 +489,8 @@ def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[
             writer = csv.writer(f)
             writer.writerow([
                 'ID', 'Username', 'First Name', 'Last Name', 'Phone', 
-                'Bot', 'Deleted', 'Premium', 'Bio', 'Scam', 'Fake', 'Join Date'
+                'Bot', 'Deleted', 'Premium', 'Verified', 'Restricted', 
+                'Lang Code', 'Status', 'Bio', 'Scam', 'Fake', 'Join Date'
             ])
 
             for user in subscribers:
@@ -447,6 +503,10 @@ def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[
                     'Да' if user.get('bot', False) else 'Нет',
                     'Да' if user.get('deleted', False) else 'Нет',
                     'Да' if user.get('premium', False) else 'Нет',
+                    'Да' if user.get('verified', False) else 'Нет',
+                    'Да' if user.get('restricted', False) else 'Нет',
+                    user.get('lang_code', '') or '',
+                    user.get('status', 'Unknown'),
                     user.get('bio', '') or '',
                     'Да' if user.get('is_scam', False) else 'Нет',
                     'Да' if user.get('is_fake', False) else 'Нет',
@@ -466,10 +526,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка команды /start"""
     user_id = update.effective_user.id
 
-    if user_id not in ADMIN_IDS:
-        if not ADMIN_IDS:
-            ADMIN_IDS.append(user_id)
-            logger.info(f"Пользователь {user_id} добавлен как первый администратор")
+    # Проверка доступа
+    if not is_user_allowed(user_id):
+        await update.message.reply_text(
+            '❌ У вас нет доступа к этому боту.\n\n'
+            'Если вы считаете, что это ошибка, свяжитесь с администратором.'
+        )
+        logger.warning(f"Попытка доступа от неавторизованного пользователя: {user_id}")
+        return
 
     keyboard = [
         [InlineKeyboardButton("📋 Список каналов", callback_data="channels_list")],
@@ -523,13 +587,9 @@ async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Обработка команды /addchannel"""
     user_id = update.effective_user.id
 
-    if user_id not in ADMIN_IDS:
-        if not ADMIN_IDS:
-            ADMIN_IDS.append(user_id)
-            logger.info(f"Пользователь {user_id} добавлен как первый администратор")
-        else:
-            await update.message.reply_text('У вас нет прав для использования этой команды.')
-            return
+    if not is_user_allowed(user_id):
+        await update.message.reply_text('У вас нет прав для использования этой команды.')
+        return
 
     if context.args:
         channel_identifier = ' '.join(context.args).strip()
@@ -551,12 +611,9 @@ async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_T
     """Обработка команды /removechannel"""
     user_id = update.effective_user.id
 
-    if user_id not in ADMIN_IDS:
-        if not ADMIN_IDS:
-            ADMIN_IDS.append(user_id)
-        else:
-            await update.message.reply_text('У вас нет прав для использования этой команды.')
-            return
+    if not is_user_allowed(user_id):
+        await update.message.reply_text('У вас нет прав для использования этой команды.')
+        return
 
     await show_remove_channel_menu(update)
 
@@ -565,13 +622,9 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Обработка команды /channels"""
     user_id = update.effective_user.id
 
-    if user_id not in ADMIN_IDS:
-        if not ADMIN_IDS:
-            ADMIN_IDS.append(user_id)
-            logger.info(f"Пользователь {user_id} добавлен как первый администратор")
-        else:
-            await update.message.reply_text('У вас нет прав для использования этой команды.')
-            return
+    if not is_user_allowed(user_id):
+        await update.message.reply_text('У вас нет прав для использования этой команды.')
+        return
 
     await show_channels_list(update)
 
@@ -621,13 +674,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     message_id = query.message.message_id
     data = query.data
 
-    if user_id not in ADMIN_IDS:
-        if not ADMIN_IDS:
-            ADMIN_IDS.append(user_id)
-            logger.info(f"Пользователь {user_id} добавлен как первый администратор")
-        else:
-            await query.answer("У вас нет прав для использования этой функции.", show_alert=True)
-            return
+    if not is_user_allowed(user_id):
+        await query.answer("У вас нет прав для использования этой функции.", show_alert=True)
+        return
 
     logger.info(f"Получен callback query: {data} от пользователя {user_id}")
 
@@ -683,9 +732,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data.startswith("channel_"):
         channel_id = data.split("_")[1]
-        await process_channel_selection(update, channel_id)
+        await show_channel_actions(update, channel_id)
 
-    elif data.startswith("remove_"):
+    elif data.startswith("parse_"):
+        channel_id = data.split("_")[1]
+        await run_channel_parsing(update, channel_id)
+
+    elif data.startswith("delete_") or data.startswith("remove_"):
         channel_id = data.split("_")[1]
         try:
             result = remove_channel(channel_id)
@@ -864,8 +917,38 @@ async def process_add_channel(update: Update, message_id: int, channel_identifie
             await update.message.reply_text(error_message, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def process_channel_selection(update: Update, channel_id: str) -> None:
-    """Обработка выбора канала для получения подписчиков"""
+async def show_channel_actions(update: Update, channel_id: str) -> None:
+    """Отображение меню действий для канала"""
+    channels = load_channels()
+    channel_info = next((ch for ch in channels if ch["id"] == channel_id), None)
+    query = update.callback_query
+
+    if not channel_info:
+        await query.edit_message_text(
+            'Канал не найден в списке.',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+            ])
+        )
+        return
+
+    channel_title = channel_info.get("title", "Канал")
+    
+    keyboard = [
+        [InlineKeyboardButton("📥 Выгрузить подписчиков", callback_data=f"parse_{channel_id}")],
+        [InlineKeyboardButton("🗑 Удалить канал", callback_data=f"delete_{channel_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+    ]
+
+    await query.edit_message_text(
+        f'Канал: *{channel_title}*\n\nВыберите действие:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def run_channel_parsing(update: Update, channel_id: str) -> None:
+    """Запуск процесса парсинга подписчиков"""
     query = update.callback_query
 
     try:
@@ -958,7 +1041,7 @@ async def process_channel_selection(update: Update, channel_id: str) -> None:
 
         if not csv_result:
             await query.edit_message_text(
-                'Ошибка при создании CSV файла.',
+                'Ошибка при создании файла.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
                 ])
@@ -966,31 +1049,29 @@ async def process_channel_selection(update: Update, channel_id: str) -> None:
             return
 
         # Отправляем файл
-        await query.edit_message_text(f"Отправка файла с {csv_result['count']} подписчиками...")
-
         with open(csv_result["filePath"], 'rb') as file:
             await update.effective_chat.send_document(
                 document=file,
                 filename=csv_result["fileName"],
-                caption=f"Список подписчиков канала \"{channel_title}\" ({csv_result['count']})\n"
-                        "Включена информация: биография, дата вступления и метки scam/fake."
+                caption=f"✅ Выгрузка завершена!\nКанал: {channel_title}\nПодписчиков: {csv_result['count']}"
             )
 
+        # Удаляем файл после отправки
         if os.path.exists(csv_result["filePath"]):
             os.remove(csv_result["filePath"])
 
         await query.edit_message_text(
-            f"✅ Выгрузка подписчиков канала \"{channel_title}\" завершена!\n\n"
-            f"Всего уникальных подписчиков: {csv_result['count']}",
+            'Готово! Что делаем дальше?',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📋 Список каналов", callback_data="channels_list")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
+                [InlineKeyboardButton("⬅️ Назад к каналу", callback_data=f"channel_{channel_id}")]
             ])
         )
+
     except Exception as e:
-        logger.error(f"Ошибка при обработке выбора канала: {e}")
+        logger.error(f"Ошибка в процессе выбора канала: {e}")
         await query.edit_message_text(
-            'Произошла ошибка при получении подписчиков. Попробуйте позже.',
+            f'Произошла ошибка: {e}',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
             ])
