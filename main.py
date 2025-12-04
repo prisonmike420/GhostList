@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telethon import TelegramClient
-from telethon.tl.types import InputPeerChannel, ChannelParticipantsSearch
+from telethon.tl.types import InputPeerChannel, ChannelParticipantsSearch, ChannelParticipantsRecent, ChannelParticipantsAdmins
 from telethon.tl.functions.channels import GetParticipantsRequest, GetFullChannelRequest, GetParticipantRequest
 from telethon.tl.functions.users import GetFullUserRequest
 
@@ -315,17 +315,108 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
             del active_downloads[message_id]
             return []
 
-        # Набор символов для поиска (латиница, кириллица, цифры, пустой поиск)
-        search_chars = [''] + list('abcdefghijklmnopqrstuvwxyz') + list('абвгдеёжзийклмнопрстуфхцчшщъыьэюя') + list('0123456789')
+        # Расширенный набор поисковых запросов
+        # Латиница, кириллица, цифры, специальные символы
+        single_chars = [''] + list('abcdefghijklmnopqrstuvwxyz') + list('абвгдеёжзийклмнопрстуфхцчшщъыьэюя') + list('0123456789')
+        
+        # Двухбуквенные комбинации для популярных букв (увеличивает охват)
+        common_ru_letters = 'аеиокнсмтв'
+        common_en_letters = 'aeiosmtnr'
+        two_letter_combos = []
+        for c1 in common_ru_letters:
+            for c2 in 'аеиоу':
+                two_letter_combos.append(c1 + c2)
+        for c1 in common_en_letters:
+            for c2 in 'aeiou':
+                two_letter_combos.append(c1 + c2)
+        
+        # Специальные символы и эмодзи-префиксы
+        special_chars = list('._-@#$%&*!?')
+        
+        search_queries = single_chars + two_letter_combos + special_chars
         
         processed_count = 0
         last_update_time = datetime.now()
-        total_searches = len(search_chars)
+        total_searches = len(search_queries) + 2  # +2 для ChannelParticipantsRecent и Admins
         
         logger.info(f"Начинаем расширенный поиск подписчиков по {total_searches} запросам...")
         
+        # Сначала получаем недавних участников (отдельный фильтр)
         try:
-            for search_idx, search_char in enumerate(search_chars):
+            logger.info("Получение недавних участников...")
+            offset = 0
+            while True:
+                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                    break
+                try:
+                    participants = await client(GetParticipantsRequest(
+                        channel=channel_peer,
+                        filter=ChannelParticipantsRecent(),
+                        offset=offset,
+                        limit=200,
+                        hash=0
+                    ))
+                    if not participants.users:
+                        break
+                    for user in participants.users:
+                        user_key = f"id{user.id}"
+                        if user_key not in unique_users:
+                            try:
+                                user_status = "Unknown"
+                                if hasattr(user, 'status'):
+                                    status = user.status
+                                    if status:
+                                        status_name = type(status).__name__
+                                        if status_name == 'UserStatusOnline':
+                                            user_status = 'Online'
+                                        elif status_name == 'UserStatusOffline':
+                                            user_status = 'Offline'
+                                        elif status_name == 'UserStatusRecently':
+                                            user_status = 'Recently'
+                                        elif status_name == 'UserStatusLastWeek':
+                                            user_status = 'Last Week'
+                                        elif status_name == 'UserStatusLastMonth':
+                                            user_status = 'Last Month'
+                                        elif status_name == 'UserStatusEmpty':
+                                            user_status = 'Empty'
+                                        else:
+                                            user_status = status_name
+                                user_data = {
+                                    'id': user.id,
+                                    'username': getattr(user, 'username', None),
+                                    'firstName': getattr(user, 'first_name', None),
+                                    'lastName': getattr(user, 'last_name', None),
+                                    'phone': getattr(user, 'phone', None),
+                                    'bot': getattr(user, 'bot', False),
+                                    'deleted': getattr(user, 'deleted', False),
+                                    'premium': getattr(user, 'premium', False),
+                                    'verified': getattr(user, 'verified', False),
+                                    'restricted': getattr(user, 'restricted', False),
+                                    'lang_code': getattr(user, 'lang_code', None),
+                                    'status': user_status,
+                                    'bio': None,
+                                    'is_scam': getattr(user, 'scam', False),
+                                    'is_fake': getattr(user, 'fake', False),
+                                    'join_date': None
+                                }
+                                unique_users[user_key] = user_data
+                                if message_id in active_downloads:
+                                    active_downloads[message_id]["partial_data"].append(user_data)
+                            except Exception as e:
+                                logger.error(f"Ошибка обработки пользователя: {e}")
+                    offset += len(participants.users)
+                    if len(participants.users) < 200:
+                        break
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.error(f"Ошибка получения недавних участников: {e}")
+                    break
+            logger.info(f"После ChannelParticipantsRecent: {len(unique_users)} пользователей")
+        except Exception as e:
+            logger.error(f"Ошибка при получении недавних участников: {e}")
+        
+        try:
+            for search_idx, search_char in enumerate(search_queries):
                 # Проверка на отмену
                 if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                     break
