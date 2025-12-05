@@ -91,6 +91,7 @@ def upsert_subscribers(subscribers: List[Dict], channel_id: int) -> int:
     """Добавить или обновить подписчиков в БД. Возвращает количество добавленных."""
     client = get_supabase_client()
     if not client or not subscribers:
+        logger.warning(f"Upsert пропущен: клиент={client is not None}, записей={len(subscribers) if subscribers else 0}")
         return 0
     
     try:
@@ -118,19 +119,35 @@ def upsert_subscribers(subscribers: List[Dict], channel_id: int) -> int:
         inserted_count = 0
         batch_size = 500
         
+        logger.info(f"Начинаем upsert {len(records)} записей для канала {channel_id}")
+        
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
-            result = client.table('subscribers').upsert(
-                batch,
-                on_conflict='id,channel_id'
-            ).execute()
-            inserted_count += len(batch)
+            try:
+                result = client.table('subscribers').upsert(
+                    batch,
+                    on_conflict='id, channel_id'
+                ).execute()
+                
+                # Логируем результат
+                if hasattr(result, 'data'):
+                    inserted_count += len(batch) # Считаем отправленные, так как upsert может не вернуть данные
+                else:
+                    logger.warning(f"Supabase upsert не вернул данные, но и не упал. Батч {i//batch_size + 1}")
+                    inserted_count += len(batch)
+                    
+            except Exception as batch_err:
+                logger.error(f"Ошибка сохранения пачки {i}: {batch_err}")
+                if hasattr(batch_err, 'code'):
+                    logger.error(f"Код ошибки Supabase: {batch_err.code}")
+                if hasattr(batch_err, 'details'):
+                    logger.error(f"Детали ошибки: {batch_err.details}")
         
-        logger.info(f"Upsert {inserted_count} подписчиков для канала {channel_id}")
+        logger.info(f"Upsert завершен. Всего обработано: {inserted_count}")
         return inserted_count
         
     except Exception as e:
-        logger.error(f"Ошибка upsert подписчиков: {e}")
+        logger.error(f"Критическая ошибка upsert подписчиков: {e}", exc_info=True)
         return 0
 
 
