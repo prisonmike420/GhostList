@@ -744,15 +744,52 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
         user_count = 0
         last_update_time = datetime.now()
         
-        raw_count = 0
-        try:
-            async for user in client.iter_participants(channel_peer, aggressive=True, limit=None):
-                raw_count += 1
-                if raw_count % 50 == 0:
-                    logger.info(f"Telethon вернул {raw_count}-го пользователя: {user.id}")
-
-                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
-                    break
+        # === РУЧНОЙ АГРЕССИВНЫЙ ПОИСК ===
+        # Ботам Telegram часто не отдает больше 200 участников без явного поиска.
+        # Мы будем искать вручную по буквам алфавита.
+        
+        # 1. Сначала пустой поиск (последние активные)
+        # 2. Затем перебор по алфавиту (русский + английский + цифры)
+        
+        english = "abcdefghijklmnopqrstuvwxyz"
+        russian = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+        digits = "0123456789"
+        
+        # Пустая строка = обычный запрос (топ 200)
+        search_queries = [""] + list(english) + list(russian) + list(digits)
+        
+        logger.info(f"Начинаем ручной поиск по {len(search_queries)} запросам...")
+        
+        # Локальный кеш обработанных в этом запуске (чтобы не обрабатывать повторы от разных букв)
+        processed_in_session = set()
+        
+        for search_query in search_queries:
+            # Проверка на отмену (на каждом шаге цикла букв)
+            if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                break
+            
+            if search_query: # Логируем только буквы, пустую пропускаем молча
+                logger.info(f"🔍 Поиск по запросу: '{search_query}'")
+            
+            try:
+                # Ищем по конкретной букве
+                async for user in client.iter_participants(channel_peer, search=search_query, limit=None):
+                    
+                    # Проверка на отмену (внутри цикла пользователей)
+                    if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                        break
+                    
+                    # Глобальный счетчик найденных (для отладки)
+                    raw_count += 1
+                    
+                    # Если этого юзера мы уже видели В ЭТОЙ СЕССИИ поиска (например, он нашелся и по "a", и по "b")
+                    if user.id in processed_in_session:
+                        continue
+                    processed_in_session.add(user.id)
+                    
+                    # -------------------------------------------------------------
+                    # Дальше стандартная логика добавления (как была)
+                    # -------------------------------------------------------------
             
                 # Проверяем, есть ли уже в БД
                 if user.id in existing_ids:
@@ -813,9 +850,10 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                         progress, True)
                     last_update_time = datetime.now()
 
-        except Exception as e:
-            logger.error(f"Ошибка в цикле iter_participants: {e}")
-            await update_progress_message(update, message_id, f"⚠️ Ошибка при чтении: {e}", progress, False)
+            except Exception as e:
+                logger.error(f"Ошибка при поиске '{search_query}': {e}")
+                # Не прерываем весь процесс из-за ошибки одной буквы, идем дальше
+                await asyncio.sleep(1)
         
         # Проверка на отмену
         if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
