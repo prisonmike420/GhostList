@@ -736,7 +736,9 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
         user_count = 0
         last_update_time = datetime.now()
         
-        async for user in client.iter_participants(channel_peer, aggressive=True):
+        logger.info(f"Начинаем агрессивный поиск участников в {channel_id}")
+        
+        async for user in client.iter_participants(channel_peer, aggressive=True, limit=None):
             if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                 break
             
