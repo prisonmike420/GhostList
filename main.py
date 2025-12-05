@@ -274,18 +274,26 @@ async def migrate_channels() -> None:
         logger.info("Каналы обновлены с accessHash")
 
 
+
 # === Функции прогресса и выгрузки ===
+
+def ansi_bar(percent: int, length: int = 20) -> str:
+    """Генерация прогресс-бара в ANSI стиле
+    
+    Пример: [██████░░░░░░░░░░░░] 30%
+    """
+    percent = max(0, min(100, percent))
+    filled = int(percent / 100 * length)
+    empty = length - filled
+    return "[" + "█" * filled + "░" * empty + f"] {percent}%"
+
 
 async def update_progress_message(update: Update, message_id: int, text: str,
                                  progress: int, add_cancel_button: bool = False) -> bool:
     """Обновление сообщения с прогрессом"""
     try:
-        progress_bar_length = 20
-        filled = int(progress_bar_length * progress / 100)
-        empty = progress_bar_length - filled
-
-        progress_bar = '█' * filled + '░' * empty
-        progress_message = f"{text}\n\n[{progress_bar}] {progress}%"
+        progress_bar = ansi_bar(progress)
+        progress_message = f"{text}\n\n{progress_bar}"
 
         keyboard = None
         if add_cancel_button:
@@ -736,11 +744,15 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
         user_count = 0
         last_update_time = datetime.now()
         
-        logger.info(f"Начинаем агрессивный поиск участников в {channel_id}")
-        
-        async for user in client.iter_participants(channel_peer, aggressive=True, limit=None):
-            if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
-                break
+        raw_count = 0
+        try:
+            async for user in client.iter_participants(channel_peer, aggressive=True, limit=None):
+                raw_count += 1
+                if raw_count % 50 == 0:
+                    logger.info(f"Telethon вернул {raw_count}-го пользователя: {user.id}")
+
+                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                    break
             
             # Проверяем, есть ли уже в БД
             if user.id in existing_ids:
@@ -800,6 +812,12 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                     f"Обработано: {user_count}",
                     progress, True)
                 last_update_time = datetime.now()
+        
+                last_update_time = datetime.now()
+
+        except Exception as e:
+            logger.error(f"Ошибка в цикле iter_participants: {e}")
+            await update_progress_message(update, message_id, f"⚠️ Ошибка при чтении: {e}", progress, False)
         
         # Проверка на отмену
         if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
@@ -1631,7 +1649,7 @@ async def run_turbo_parsing(update: Update, channel_id: str) -> None:
         new_count = result.get("new_count", 0)
         
         progress_pct = int(db_count / max(channel_count, 1) * 100)
-        progress_bar = '█' * (progress_pct // 5) + '░' * (20 - progress_pct // 5)
+        progress_bar = ansi_bar(progress_pct)
 
         await query.edit_message_text(
             f'✅ Турбо-режим завершён!\n\n'
@@ -1639,7 +1657,7 @@ async def run_turbo_parsing(update: Update, channel_id: str) -> None:
             f'📊 В канале: {channel_count}\n'
             f'💾 В базе: {db_count}\n'
             f'🆕 Добавлено: {new_count}\n\n'
-            f'[{progress_bar}] {progress_pct}%\n\n'
+            f'{progress_bar}\n\n'
             f'{"✅ Все подписчики собраны!" if db_count >= channel_count else "⚡ Запустите ещё раз для добора"}',
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
