@@ -105,6 +105,20 @@ async def get_user_join_date(channel_peer, user_id):
         return None
 
 
+async def get_user_full_info_by_id(user_id: int) -> Dict[str, Any]:
+    """Получение полной информации о пользователе по ID"""
+    try:
+        full_user = await client(GetFullUserRequest(user_id))
+        return {
+            'bio': getattr(full_user.full_user, 'about', None),
+            'is_scam': False,  # Эти поля уже есть в базовом User
+            'is_fake': False
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при получении полной информации о пользователе {user_id}: {e}")
+        return {'bio': None, 'is_scam': False, 'is_fake': False}
+
+
 # === Функции работы с каналами ===
 
 def load_channels() -> List[Dict]:
@@ -283,14 +297,22 @@ async def update_progress_message(update: Update, message_id: int, text: str,
         return False
 
 
-async def get_channel_subscribers(channel_peer, update: Update, message_id: int) -> List[Dict]:
-    """Получение списка подписчиков канала с отображением прогресса"""
+async def get_channel_subscribers(channel_peer, update: Update, message_id: int, extended_mode: bool = False) -> List[Dict]:
+    """Получение списка подписчиков канала с отображением прогресса
+    
+    Args:
+        channel_peer: Объект канала
+        update: Telegram Update
+        message_id: ID сообщения для обновления прогресса
+        extended_mode: Если True, получаем bio и дату подписки (медленнее)
+    """
     download_tracker = {"cancelled": False, "partial_data": []}
     active_downloads[message_id] = download_tracker
 
     try:
+        mode_text = "расширенный режим (bio + дата)" if extended_mode else "быстрый режим"
         await update_progress_message(update, message_id, 
-            'Запущено получение подписчиков канала. Пожалуйста, ожидайте...', 0, True)
+            f'Запущено получение подписчиков канала ({mode_text}). Пожалуйста, ожидайте...', 0, True)
 
         unique_users = {}
         participants_count = 0
@@ -301,12 +323,12 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
             participants_count = getattr(full_channel_info.full_chat, 'participants_count', 0)
 
             await update_progress_message(update, message_id,
-                f"Получение подписчиков канала. Примерное количество участников: {participants_count}",
+                f"Получение подписчиков канала. Примерное количество: {participants_count}\nРежим: {mode_text}",
                 5, True)
         except Exception as e:
             logger.error(f"Ошибка при получении информации о канале: {e}")
             await update_progress_message(update, message_id,
-                "Получение подписчиков канала. Не удалось определить размер канала.",
+                f"Получение подписчиков канала. Режим: {mode_text}",
                 5, True)
 
         # Проверка на отмену
@@ -317,11 +339,12 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
 
         last_update_time = datetime.now()
         
-        # ============ МЕТОД 1: iter_participants (автоматическая пагинация) ============
+        # ============ МЕТОД 1: iter_participants ============
         logger.info("Метод 1: Получение через iter_participants...")
         try:
             user_count = 0
-            async for user in client.iter_participants(channel_peer, aggressive=True):
+            # Убран aggressive=True - deprecated и больше не работает
+            async for user in client.iter_participants(channel_peer):
                 if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                     break
                     
@@ -347,6 +370,7 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                                     user_status = 'Empty'
                                 else:
                                     user_status = status_name
+                        
                         user_data = {
                             'id': user.id,
                             'username': getattr(user, 'username', None),
@@ -363,16 +387,16 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                             'bio': None,
                             'is_scam': getattr(user, 'scam', False),
                             'is_fake': getattr(user, 'fake', False),
-                            'join_date': None
+                            'join_date': None,
+                            '_user_obj': user if extended_mode else None  # Сохраняем для расширенного режима
                         }
                         unique_users[user_key] = user_data
                         if message_id in active_downloads:
                             active_downloads[message_id]["partial_data"].append(user_data)
                         user_count += 1
                         
-                        # Обновляем прогресс каждые 500 пользователей или каждые 3 секунды
                         if user_count % 500 == 0 or (datetime.now() - last_update_time).total_seconds() > 3:
-                            progress = min(45, int(user_count / max(participants_count, 1) * 45))
+                            progress = min(30, int(user_count / max(participants_count, 1) * 30))
                             await update_progress_message(update, message_id,
                                 f"Метод 1: Получено {len(unique_users)} пользователей...\n"
                                 f"Всего в канале: {participants_count}",
@@ -385,37 +409,113 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
         except Exception as e:
             logger.error(f"Ошибка iter_participants: {e}")
         
-        # ============ МЕТОД 2: Алфавитный поиск для дополнительных пользователей ============
-        logger.info("Метод 2: Алфавитный поиск...")
+        # ============ МЕТОД 2: ChannelParticipantsRecent ============
+        logger.info("Метод 2: Получение недавних участников...")
+        try:
+            offset = 0
+            limit = 200
+            while True:
+                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                    break
+                    
+                participants = await client(GetParticipantsRequest(
+                    channel=channel_peer,
+                    filter=ChannelParticipantsRecent(),
+                    offset=offset,
+                    limit=limit,
+                    hash=0
+                ))
+                
+                if not participants.users:
+                    break
+                    
+                for user in participants.users:
+                    user_key = f"id{user.id}"
+                    if user_key not in unique_users:
+                        user_status = "Unknown"
+                        if hasattr(user, 'status') and user.status:
+                            status_name = type(user.status).__name__
+                            status_map = {
+                                'UserStatusOnline': 'Online',
+                                'UserStatusOffline': 'Offline', 
+                                'UserStatusRecently': 'Recently',
+                                'UserStatusLastWeek': 'Last Week',
+                                'UserStatusLastMonth': 'Last Month',
+                                'UserStatusEmpty': 'Empty'
+                            }
+                            user_status = status_map.get(status_name, status_name)
+                        
+                        user_data = {
+                            'id': user.id,
+                            'username': getattr(user, 'username', None),
+                            'firstName': getattr(user, 'first_name', None),
+                            'lastName': getattr(user, 'last_name', None),
+                            'phone': getattr(user, 'phone', None),
+                            'bot': getattr(user, 'bot', False),
+                            'deleted': getattr(user, 'deleted', False),
+                            'premium': getattr(user, 'premium', False),
+                            'verified': getattr(user, 'verified', False),
+                            'restricted': getattr(user, 'restricted', False),
+                            'lang_code': getattr(user, 'lang_code', None),
+                            'status': user_status,
+                            'bio': None,
+                            'is_scam': getattr(user, 'scam', False),
+                            'is_fake': getattr(user, 'fake', False),
+                            'join_date': None,
+                            '_user_obj': user if extended_mode else None
+                        }
+                        unique_users[user_key] = user_data
+                        if message_id in active_downloads:
+                            active_downloads[message_id]["partial_data"].append(user_data)
+                
+                offset += len(participants.users)
+                if len(participants.users) < limit:
+                    break
+                await asyncio.sleep(0.3)
+                
+            logger.info(f"После ChannelParticipantsRecent: {len(unique_users)} пользователей")
+        except Exception as e:
+            logger.error(f"Ошибка ChannelParticipantsRecent: {e}")
+        
+        # ============ МЕТОД 3: Расширенный алфавитный поиск ============
+        logger.info("Метод 3: Расширенный алфавитный поиск...")
         
         # Расширенный набор поисковых запросов
         single_chars = [''] + list('abcdefghijklmnopqrstuvwxyz') + list('абвгдеёжзийклмнопрстуфхцчшщъыьэюя') + list('0123456789')
         
-        # Двухбуквенные комбинации для популярных букв
-        common_ru_letters = 'аеиокнсмтвпр'
-        common_en_letters = 'aeiosmtnrld'
-        two_letter_combos = []
-        for c1 in common_ru_letters:
-            for c2 in 'аеиоу':
-                two_letter_combos.append(c1 + c2)
-        for c1 in common_en_letters:
-            for c2 in 'aeiou':
-                two_letter_combos.append(c1 + c2)
+        # Двухбуквенные комбинации
+        common_ru = 'аеиокнсмтвпрдлб'
+        common_en = 'aeiosmtnrldcbpg'
+        two_letter = []
+        for c1 in common_ru:
+            for c2 in 'аеиоуыя':
+                two_letter.append(c1 + c2)
+        for c1 in common_en:
+            for c2 in 'aeiouy':
+                two_letter.append(c1 + c2)
         
-        # Специальные символы
-        special_chars = list('._-@#$%&*!?')
+        # Трёхбуквенные популярные комбинации
+        three_letter = ['ale', 'and', 'ann', 'ant', 'max', 'mar', 'mic', 'nik', 'ole', 'ser', 'vic', 'vol',
+                        'але', 'ана', 'анд', 'анн', 'ант', 'вик', 'вла', 'дан', 'дми', 'ека', 'ива', 'иль',
+                        'кир', 'мак', 'мар', 'мих', 'ник', 'оле', 'пав', 'сер', 'тат', 'юли', 'юри']
         
-        search_queries = single_chars + two_letter_combos + special_chars
+        # Числовые комбинации (00-99)
+        number_combos = [f"{i:02d}" for i in range(100)]
+        
+        # Специальные символы и emoji
+        special_chars = list('._-@#$%&*!?+')
+        emoji_chars = ['😀', '😎', '🔥', '❤', '👍', '🎉', '💪', '🌟', '✨', '🎸', '🎮', '💻']
+        
+        search_queries = single_chars + two_letter + three_letter + number_combos + special_chars + emoji_chars
         total_searches = len(search_queries)
         
         await update_progress_message(update, message_id,
-            f"Метод 2: Алфавитный поиск ({total_searches} запросов)...\n"
+            f"Метод 3: Расширенный поиск ({total_searches} запросов)...\n"
             f"Уже найдено: {len(unique_users)} пользователей",
-            50, True)
+            35, True)
         
         try:
             for search_idx, search_char in enumerate(search_queries):
-                # Проверка на отмену
                 if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                     break
                 
@@ -423,7 +523,6 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                 limit = 200
                 
                 while True:
-                    # Проверка на отмену внутри цикла
                     if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                         break
                     
@@ -442,90 +541,122 @@ async def get_channel_subscribers(channel_peer, update: Update, message_id: int)
                         for user in participants.users:
                             user_key = f"id{user.id}"
                             if user_key not in unique_users:
-                                try:
-                                    # Определяем статус пользователя
-                                    user_status = "Unknown"
-                                    if hasattr(user, 'status'):
-                                        status = user.status
-                                        if status:
-                                            status_name = type(status).__name__
-                                            if status_name == 'UserStatusOnline':
-                                                user_status = 'Online'
-                                            elif status_name == 'UserStatusOffline':
-                                                user_status = 'Offline'
-                                            elif status_name == 'UserStatusRecently':
-                                                user_status = 'Recently'
-                                            elif status_name == 'UserStatusLastWeek':
-                                                user_status = 'Last Week'
-                                            elif status_name == 'UserStatusLastMonth':
-                                                user_status = 'Last Month'
-                                            elif status_name == 'UserStatusEmpty':
-                                                user_status = 'Empty'
-                                            else:
-                                                user_status = status_name
-
-                                    user_data = {
-                                        'id': user.id,
-                                        'username': getattr(user, 'username', None),
-                                        'firstName': getattr(user, 'first_name', None),
-                                        'lastName': getattr(user, 'last_name', None),
-                                        'phone': getattr(user, 'phone', None),
-                                        'bot': getattr(user, 'bot', False),
-                                        'deleted': getattr(user, 'deleted', False),
-                                        'premium': getattr(user, 'premium', False),
-                                        'verified': getattr(user, 'verified', False),
-                                        'restricted': getattr(user, 'restricted', False),
-                                        'lang_code': getattr(user, 'lang_code', None),
-                                        'status': user_status,
-                                        'bio': None,
-                                        'is_scam': getattr(user, 'scam', False),
-                                        'is_fake': getattr(user, 'fake', False),
-                                        'join_date': None
+                                user_status = "Unknown"
+                                if hasattr(user, 'status') and user.status:
+                                    status_name = type(user.status).__name__
+                                    status_map = {
+                                        'UserStatusOnline': 'Online',
+                                        'UserStatusOffline': 'Offline', 
+                                        'UserStatusRecently': 'Recently',
+                                        'UserStatusLastWeek': 'Last Week',
+                                        'UserStatusLastMonth': 'Last Month',
+                                        'UserStatusEmpty': 'Empty'
                                     }
-                                    unique_users[user_key] = user_data
+                                    user_status = status_map.get(status_name, status_name)
 
-                                    if message_id in active_downloads:
-                                        active_downloads[message_id]["partial_data"].append(user_data)
-
-                                except Exception as user_error:
-                                    logger.error(f"Ошибка при обработке пользователя {user.id}: {user_error}")
+                                user_data = {
+                                    'id': user.id,
+                                    'username': getattr(user, 'username', None),
+                                    'firstName': getattr(user, 'first_name', None),
+                                    'lastName': getattr(user, 'last_name', None),
+                                    'phone': getattr(user, 'phone', None),
+                                    'bot': getattr(user, 'bot', False),
+                                    'deleted': getattr(user, 'deleted', False),
+                                    'premium': getattr(user, 'premium', False),
+                                    'verified': getattr(user, 'verified', False),
+                                    'restricted': getattr(user, 'restricted', False),
+                                    'lang_code': getattr(user, 'lang_code', None),
+                                    'status': user_status,
+                                    'bio': None,
+                                    'is_scam': getattr(user, 'scam', False),
+                                    'is_fake': getattr(user, 'fake', False),
+                                    'join_date': None,
+                                    '_user_obj': user if extended_mode else None
+                                }
+                                unique_users[user_key] = user_data
+                                if message_id in active_downloads:
+                                    active_downloads[message_id]["partial_data"].append(user_data)
                         
                         offset += len(participants.users)
-                        
-                        # Если получили меньше лимита, значит это последняя страница для данного поиска
                         if len(participants.users) < limit:
                             break
-                        
-                        # Небольшая задержка чтобы не превысить лимиты API
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(0.25)
                         
                     except Exception as e:
                         logger.error(f"Ошибка при поиске '{search_char}': {e}")
                         break
                 
-                # Обновляем прогресс после каждого символа поиска
                 if (datetime.now() - last_update_time).total_seconds() > 2:
-                    search_progress = 50 + int((search_idx + 1) / total_searches * 45)
+                    search_progress = 35 + int((search_idx + 1) / total_searches * 45)
                     await update_progress_message(update, message_id,
-                        f"Метод 2: Найдено {len(unique_users)} пользователей\n"
+                        f"Метод 3: Найдено {len(unique_users)} пользователей\n"
                         f"Поиск: {search_idx + 1}/{total_searches}\n"
                         f"Всего в канале: {participants_count}",
-                        min(95, search_progress), True)
+                        min(80, search_progress), True)
                     last_update_time = datetime.now()
                 
-                # Небольшая задержка между поисками
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.15)
                 
         except Exception as e:
-            logger.error(f"Ошибка при получении подписчиков: {e}")
+            logger.error(f"Ошибка при алфавитном поиске: {e}")
 
-        # Проверка на отмену после цикла
+        # Проверка на отмену
         if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
             await update_progress_message(update, message_id, 'Выгрузка отменена пользователем.', 100, False)
             del active_downloads[message_id]
             return []
 
         logger.info(f"Расширенный поиск завершен. Найдено {len(unique_users)} уникальных пользователей.")
+        
+        # ============ РАСШИРЕННЫЙ РЕЖИМ: Получение bio и даты подписки ============
+        if extended_mode and unique_users:
+            await update_progress_message(update, message_id,
+                f"Расширенный режим: Получение bio и даты подписки...\n"
+                f"Пользователей: {len(unique_users)}",
+                82, True)
+            
+            processed = 0
+            total_to_process = len(unique_users)
+            
+            for user_key, user_data in unique_users.items():
+                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                    break
+                
+                # Пропускаем ботов и удалённые аккаунты
+                if user_data.get('bot') or user_data.get('deleted'):
+                    processed += 1
+                    continue
+                
+                try:
+                    # Получаем bio
+                    full_info = await get_user_full_info_by_id(user_data['id'])
+                    if full_info:
+                        user_data['bio'] = full_info.get('bio')
+                    
+                    # Получаем дату подписки
+                    join_date = await get_user_join_date(channel_peer, user_data['id'])
+                    if join_date:
+                        user_data['join_date'] = join_date.isoformat() if hasattr(join_date, 'isoformat') else str(join_date)
+                    
+                    await asyncio.sleep(0.5)  # Rate limiting
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка получения расширенной информации для {user_data['id']}: {e}")
+                
+                processed += 1
+                
+                # Обновляем прогресс каждые 50 пользователей
+                if processed % 50 == 0 or (datetime.now() - last_update_time).total_seconds() > 5:
+                    ext_progress = 82 + int(processed / total_to_process * 17)
+                    await update_progress_message(update, message_id,
+                        f"Расширенный режим: {processed}/{total_to_process}\n"
+                        f"Получение bio и даты подписки...",
+                        min(99, ext_progress), True)
+                    last_update_time = datetime.now()
+            
+            # Удаляем временное поле _user_obj
+            for user_data in unique_users.values():
+                user_data.pop('_user_obj', None)
 
         # Завершающее сообщение
         await update_progress_message(update, message_id,
@@ -863,9 +994,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         channel_id = data.split("_")[1]
         await show_channel_actions(update, channel_id)
 
+    elif data.startswith("parse_ext_"):
+        # Расширенный парсинг (с bio и датой подписки)
+        channel_id = data.split("_")[2]
+        await run_channel_parsing(update, channel_id, extended_mode=True)
+
     elif data.startswith("parse_"):
+        # Быстрый парсинг (без bio и даты)
         channel_id = data.split("_")[1]
-        await run_channel_parsing(update, channel_id)
+        await run_channel_parsing(update, channel_id, extended_mode=False)
 
     elif data.startswith("delete_") or data.startswith("remove_"):
         channel_id = data.split("_")[1]
@@ -1064,26 +1201,39 @@ async def show_channel_actions(update: Update, channel_id: str) -> None:
     channel_title = channel_info.get("title", "Канал")
     
     keyboard = [
-        [InlineKeyboardButton("📥 Выгрузить подписчиков", callback_data=f"parse_{channel_id}")],
+        [InlineKeyboardButton("⚡ Быстрый парсинг", callback_data=f"parse_{channel_id}")],
+        [InlineKeyboardButton("📋 Расширенный (+ bio, дата)", callback_data=f"parse_ext_{channel_id}")],
         [InlineKeyboardButton("🗑 Удалить канал", callback_data=f"delete_{channel_id}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
     ]
 
     await query.edit_message_text(
-        f'Канал: *{channel_title}*\n\nВыберите действие:',
+        f'Канал: *{channel_title}*\n\n'
+        '⚡ *Быстрый* — только базовая информация\n'
+        '📋 *Расширенный* — + bio и дата подписки (значительно дольше)\n\n'
+        'Выберите режим парсинга:',
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-async def run_channel_parsing(update: Update, channel_id: str) -> None:
-    """Запуск процесса парсинга подписчиков"""
+async def run_channel_parsing(update: Update, channel_id: str, extended_mode: bool = False) -> None:
+    """Запуск процесса парсинга подписчиков
+    
+    Args:
+        update: Telegram Update
+        channel_id: ID канала
+        extended_mode: Если True, получаем bio и дату подписки (медленнее)
+    """
     query = update.callback_query
 
     try:
+        mode_text = "расширенный режим (+ bio, дата подписки)" if extended_mode else "быстрый режим"
+        warning = "\n\n⚠️ Расширенный режим может занять значительное время!" if extended_mode else ""
+        
         await query.edit_message_text(
-            'Получение списка подписчиков... Это может занять некоторое время. '
-            'Собираем информацию о пользователях (биография, дата присоединения и др.).'
+            f'Получение списка подписчиков...\n'
+            f'Режим: {mode_text}{warning}'
         )
 
         channels = load_channels()
@@ -1149,7 +1299,7 @@ async def run_channel_parsing(update: Update, channel_id: str) -> None:
         channel_title = channel_info.get("title", "Канал")
 
         # Получаем подписчиков
-        subscribers = await get_channel_subscribers(channel_entity, update, query.message.message_id)
+        subscribers = await get_channel_subscribers(channel_entity, update, query.message.message_id, extended_mode)
 
         if subscribers is None:
             return
