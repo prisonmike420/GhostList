@@ -732,65 +732,110 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
         existing_ids = db.get_existing_ids(channel_id)
         db_count_before = len(existing_ids)
         
+        # Загружаем историю обработанных запросов
+        processed_history = db.get_processed_queries(channel_id)
+        
         await update_progress_message(update, message_id,
             f"⚡ Турбо-режим\n\n"
             f"📊 В канале: {participants_count}\n"
-            f"💾 В базе: {db_count_before}\n\n"
+            f"💾 В базе: {db_count_before}\n"
+            f"♻️ Пропущено запросов: {len(processed_history)}\n\n"
             f"Получение подписчиков...",
-            10, True)
+            5, True)
         
         # Собираем новых пользователей
         new_users = []
         user_count = 0
         last_update_time = datetime.now()
         
-        # === РУЧНОЙ АГРЕССИВНЫЙ ПОИСК ===
-        # Ботам Telegram часто не отдает больше 200 участников без явного поиска.
-        # Мы будем искать вручную по буквам алфавита.
+        # === ЭТАП 1: НЕДАВНИЕ ПОДПИСЧИКИ (ОБЯЗАТЕЛЬНО) ===
+        # Этот этап выполняется ВСЕГДА, чтобы найти тех, кто вступил недавно
         
-        # 1. Сначала пустой поиск (последние активные)
-        # 2. Затем перебор по алфавиту (русский + английский + цифры)
+        logger.info("Этап 1: Получение последних участников (ChannelParticipantsRecent)...")
+        await update_progress_message(update, message_id,
+            f"⚡ Поиск новых подписчиков...\n(ChannelParticipantsRecent)",
+            10, True)
+
+        try:
+            async for user in client.iter_participants(channel_peer, filter=ChannelParticipantsRecent(), limit=None):
+                if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                    break
+                
+                if user.id in existing_ids:
+                    continue
+                
+                user_status = "Unknown"
+                if hasattr(user, 'status') and user.status:
+                    status_name = type(user.status).__name__
+                    status_map = {
+                        'UserStatusOnline': 'Online',
+                        'UserStatusOffline': 'Offline', 
+                        'UserStatusRecently': 'Recently',
+                        'UserStatusLastWeek': 'Last Week',
+                        'UserStatusLastMonth': 'Last Month',
+                        'UserStatusEmpty': 'Empty'
+                    }
+                    user_status = status_map.get(status_name, status_name)
+                
+                user_data = {
+                    'id': user.id,
+                    'username': getattr(user, 'username', None),
+                    'firstName': getattr(user, 'first_name', None),
+                    'lastName': getattr(user, 'last_name', None),
+                    'phone': getattr(user, 'phone', None),
+                    'bot': getattr(user, 'bot', False),
+                    'status': user_status,
+                    'bio': None,
+                    'join_date': None
+                }
+                
+                new_users.append(user_data)
+                existing_ids.add(user.id)
+                user_count += 1
+            
+            # Сохраняем найденных "свежих" сразу
+            if new_users:
+                db.upsert_subscribers(new_users, channel_id)
+                db_count_before += len(new_users)
+                new_users = []
+                
+        except Exception as e:
+            logger.error(f"Ошибка при получении Recent участников: {e}")
+
         
-        english = "abcdefghijklmnopqrstuvwxyz"
-        russian = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-        digits = "0123456789"
-        
-        # Пустая строка = обычный запрос (топ 200)
-        search_queries = [""] + list(english) + list(russian) + list(digits)
-        
-        logger.info(f"Начинаем ручной поиск по {len(search_queries)} запросам...")
-        
-        # === УМНЫЙ ПОИСК (DRILL-DOWN) ===
-        # Если поиск по букве "А" возвращает 200 человек (лимит), 
-        # мы автоматически дробим его на "Аа", "Аб", "Ав"...
+        # === ЭТАП 2: АЛФАВИТНЫЙ ПОИСК (С ИСТОРИЕЙ) ===
         
         english = list("abcdefghijklmnopqrstuvwxyz")
         russian = list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
         digits = list("0123456789")
         
-        # Начальная очередь: пустой поиск + все буквы и цифры
-        search_queue = [""] + english + russian + digits
+        # Начальная очередь (без пустой строки, т.к. "Recent" мы уже сделали)
+        search_queue = english + russian + digits
         
-        logger.info(f"Начинаем умный поиск. В очереди: {len(search_queue)} запросов.")
+        logger.info(f"Начинаем умный поиск. В очереди: {len(search_queue)} базовых запросов.")
         
-        # Кеш уже обработанных запросов, чтобы не дублировать
-        processed_queries = set()
+        # Кеш уже обработанных В ТЕКУЩЕЙ СЕССИИ запросов
+        session_processed = set()
         
         while search_queue:
             # Берем следующий запрос
             search_query = search_queue.pop(0)
             
-            if search_query in processed_queries:
+            # Если запрос уже был обработан успешно в прошлых запусках -> СКИПАЕМ
+            if search_query in processed_history:
+                logger.info(f"⏩ Пропускаем '{search_query}' (уже обработан ранее)")
                 continue
-            processed_queries.add(search_query)
+                
+            if search_query in session_processed:
+                continue
+            session_processed.add(search_query)
             
             # Проверка на отмену
             if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                 break
             
             # Логируем
-            if search_query:
-                logger.info(f"🔍 Поиск: '{search_query}' (в очереди еще {len(search_queue)})")
+            logger.info(f"🔍 Поиск: '{search_query}' (в очереди еще {len(search_queue)})")
             
             query_users_found = 0
             
@@ -803,10 +848,7 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                     
                     query_users_found += 1
                     
-                    # Проверяем уникальность для сессии (UI) и для БД
                     if user.id in existing_ids:
-                         # Даже если есть в БД, мы всё равно считаем его для проверки лимита запроса (200)
-                         # Но не сохраняем повторно
                         continue
                     
                     # === СБОР ДАННЫХ ===
@@ -851,40 +893,36 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                             f"⚡ Турбо-режим: '{search_query}'\n\n"
                             f"📊 В канале: {participants_count}\n"
                             f"💾 В базе: {db_count_before}\n"
-                            f"📝 Очередь запросов: {len(search_queue)}\n"
+                            f"📝 Очередь: {len(search_queue)}\n"
                             f"🔥 Найдено: {user_count}",
                             progress_pct, True)
 
                 # === АНАЛИЗ РЕЗУЛЬТАТОВ ЗАПРОСА ===
                 # Если вернулось >= 180 человек (близко к лимиту 200), значит список обрезан.
-                # Нужно дробить запрос на более мелкие.
                 if query_users_found >= 180:
-                    if len(search_query) < 2: # Ограничиваем глубину (2 символа = 5000+ запросов, хватит з головой)
+                    if len(search_query) < 2: # Ограничиваем глубину
                         logger.warning(f"⚠️ Запрос '{search_query}' вернул {query_users_found} (лимит). Дробим...")
                         
-                        # Определяем, какие суффиксы добавить
                         suffixes = []
-                        if not search_query: # Если это был пустой поиск
-                            # Мы уже добавили все буквы в очередь при инициализации, ничего делать не надо
-                            pass
-                        elif search_query[0].lower() in english:
+                        if search_query[0].lower() in english:
                             suffixes = english
                         elif search_query[0].lower() in russian:
                             suffixes = russian
                         elif search_query[0] in digits:
                             suffixes = digits
                         else:
-                            suffixes = english + russian # На всякий случай
+                            suffixes = english + russian
                             
-                        # Генерируем углубленные запросы: "a" -> "aa", "ab", "ac"...
                         new_queries = [search_query + char for char in suffixes]
-                        # Добавляем в начало очереди (Depth-First Search) для скорости
                         search_queue = new_queries + search_queue
                         
                         await update_progress_message(update, message_id,
                             f"⚡ Углубление поиска для '{search_query}'...\n"
                             f"Найдено слишком много людей, уточняем...",
                             progress_pct, True)
+                else:
+                    # Если найдено меньше лимита, сохраняем запрос как обработанный
+                    db.add_processed_query(channel_id, search_query)
 
             except Exception as e:
                 logger.error(f"Ошибка поиска '{search_query}': {e}")
@@ -917,14 +955,14 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
             f"✅ Турбо-режим завершён!\n\n"
             f"📊 В канале: {participants_count}\n"
             f"💾 В базе: {db_count_after}\n"
-            f"🆕 Добавлено: {len(new_users)}",
+            f"🆕 Добавлено: {user_count}",
             100, False)
         
         if message_id in active_downloads:
             del active_downloads[message_id]
         
         return {
-            "new_count": len(new_users),
+            "new_count": user_count,
             "db_count": db_count_after,
             "channel_count": participants_count,
             "cancelled": False

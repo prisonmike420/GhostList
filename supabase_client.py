@@ -247,3 +247,62 @@ def delete_channel_subscribers(channel_id: int) -> bool:
     except Exception as e:
         logger.error(f"Ошибка удаления подписчиков канала: {e}")
         return False
+
+def get_processed_queries(channel_id: int) -> Set[str]:
+    """Получить обработанные поисковые запросы за последние 24 часа"""
+    client = get_supabase_client()
+    if not client:
+        return set()
+    
+    try:
+        from datetime import timedelta
+        yesterday = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        
+        # Получаем все запросы, созданные за последние 24 часа
+        processed = set()
+        offset = 0
+        limit = 1000
+        
+        while True:
+            result = client.table('search_history')\
+                .select('query')\
+                .eq('channel_id', channel_id)\
+                .gte('created_at', yesterday)\
+                .range(offset, offset + limit - 1)\
+                .execute()
+            
+            if not result.data:
+                break
+            
+            for row in result.data:
+                processed.add(row['query'])
+            
+            if len(result.data) < limit:
+                break
+            
+            offset += limit
+            
+        logger.info(f"Загружено {len(processed)} обработанных запросов для канала {channel_id}")
+        return processed
+    except Exception as e:
+        logger.error(f"Ошибка получения истории поиска: {e}")
+        return set()
+
+
+def add_processed_query(channel_id: int, query: str) -> bool:
+    """Сохранить обработанный поисковый запрос (или обновить время)"""
+    client = get_supabase_client()
+    if not client:
+        return False
+    
+    try:
+        # Используем upsert: если такой запрос уже был когда-то, обновится created_at
+        client.table('search_history').upsert({
+            'channel_id': channel_id,
+            'query': query,
+            'created_at': datetime.utcnow().isoformat()
+        }, on_conflict='channel_id, query').execute()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения истории поиска '{query}': {e}")
+        return False
