@@ -760,108 +760,93 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
         
         logger.info(f"Начинаем ручной поиск по {len(search_queries)} запросам...")
         
-        # Локальный кеш обработанных в этом запуске (чтобы не обрабатывать повторы от разных букв)
-        processed_in_session = set()
-        raw_count = 0 
-        
-        for search_query in search_queries:
-            # Проверка на отмену (на каждом шаге цикла букв)
+        while True:
+            # Проверка на отмену
             if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                 break
-            
-            if search_query: # Логируем только буквы, пустую пропускаем молча
-                logger.info(f"🔍 Поиск по запросу: '{search_query}'")
+
+            current_db_count = db.get_subscriber_count(channel_id)
+            if current_db_count >= participants_count:
+                break
+                
+            iteration_new_count = 0
+            logger.info(f"🔄 Запуск прохода... В базе: {current_db_count}/{participants_count}")
             
             try:
-                # Ищем по конкретной букве
-                async for user in client.iter_participants(channel_peer, search=search_query, limit=None):
+                # Используем встроенный aggressive=True, он быстрее моего ручного перебора
+                async for user in client.iter_participants(channel_peer, aggressive=True, limit=None):
                     
-                    # Проверка на отмену (внутри цикла пользователей)
                     if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                         break
                     
-                    # Глобальный счетчик найденных (для отладки)
-                    raw_count += 1
-                    
-                    # Если этого юзера мы уже видели В ЭТОЙ СЕССИИ поиска (например, он нашелся и по "a", и по "b")
-                    if user.id in processed_in_session:
+                    # Пропускаем, если уже есть в БД (проверка в памяти для скорости)
+                    if user.id in existing_ids:
                         continue
-                    processed_in_session.add(user.id)
                     
-                    # -------------------------------------------------------------
-                    # Дальше стандартная логика добавления (как была)
-                    # -------------------------------------------------------------
-            
-                # Проверяем, есть ли уже в БД
-                if user.id in existing_ids:
-                    user_count += 1
-                    continue
-                
-                # Получаем статус
-                user_status = "Unknown"
-                if hasattr(user, 'status') and user.status:
-                    status_name = type(user.status).__name__
-                    status_map = {
-                        'UserStatusOnline': 'Online',
-                        'UserStatusOffline': 'Offline',
-                        'UserStatusRecently': 'Recently',
-                        'UserStatusLastWeek': 'Last Week',
-                        'UserStatusLastMonth': 'Last Month',
-                        'UserStatusEmpty': 'Empty'
+                    # === СБОР ДАННЫХ ===
+                    user_status = "Unknown"
+                    if hasattr(user, 'status') and user.status:
+                        status_name = type(user.status).__name__
+                        status_map = {
+                            'UserStatusOnline': 'Online',
+                            'UserStatusOffline': 'Offline',
+                            'UserStatusRecently': 'Recently',
+                            'UserStatusLastWeek': 'Last Week',
+                            'UserStatusLastMonth': 'Last Month',
+                            'UserStatusEmpty': 'Empty'
+                        }
+                        user_status = status_map.get(status_name, status_name)
+                    
+                    user_data = {
+                        'id': user.id,
+                        'username': getattr(user, 'username', None),
+                        'firstName': getattr(user, 'first_name', None),
+                        'lastName': getattr(user, 'last_name', None),
+                        'phone': getattr(user, 'phone', None),
+                        'bot': getattr(user, 'bot', False),
+                        'status': user_status,
+                        'bio': None, # В турбо режиме не забираем
+                        'join_date': None
                     }
-                    user_status = status_map.get(status_name, status_name)
-                
-                user_data = {
-                    'id': user.id,
-                    'username': getattr(user, 'username', None),
-                    'firstName': getattr(user, 'first_name', None),
-                    'lastName': getattr(user, 'last_name', None),
-                    'phone': getattr(user, 'phone', None),
-                    'bot': getattr(user, 'bot', False),
-                    'status': user_status,
-                    'bio': None,
-                    'join_date': None
-                }
-                new_users.append(user_data)
-                user_count += 1
-                
-                    # Сохраняем пачками по 20 (чаще, чтобы пользователь видел прогресс)
-                if len(new_users) >= 20:
-                    await update_progress_message(update, message_id,
-                        f"⚡ Турбо-режим\n\n"
-                        f"📊 В канале: {participants_count}\n"
-                        f"💾 В базе: {db_count_before}\n"
-                        f"🆕 Новых: {len(existing_ids) + len(new_users)}\n\n"
-                        f"Сохранение пачки...",
-                        progress, True)
                     
-                    inserted = db.upsert_subscribers(new_users, channel_id)
-                    db_count_before += inserted
-                    new_users = []  # Очищаем список после сохранения
+                    # === МГНОВЕННОЕ СОХРАНЕНИЕ В ПАМЯТЬ И БД ===
+                    new_users.append(user_data)
+                    existing_ids.add(user.id) # Сразу метим как существующего
+                    iteration_new_count += 1
+                    user_count += 1
                     
-                # Обновляем прогресс
-                if user_count % 50 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
-                    progress = min(95, int(user_count / max(participants_count, 1) * 95))
-                    await update_progress_message(update, message_id,
-                        f"⚡ Турбо-режим: '{search_query}'\n\n"
-                        f"📊 В канале: {participants_count}\n"
-                        f"💾 В базе: {db_count_before}\n"
-                        f"🆕 В буфере: {len(new_users)}\n"
-                        f"⏭ Пропущено: {raw_count - len(processed_in_session)}\n\n"
-                        f"Обработано: {len(processed_in_session)}",
-                        progress, True)
-                    last_update_time = datetime.now()
+                    # Пишем в базу ОЧЕНЬ часто (каждые 10 человек), чтобы данные не терялись
+                    if len(new_users) >= 10:
+                        db.upsert_subscribers(new_users, channel_id)
+                        db_count_before += len(new_users)
+                        new_users = [] # Очищаем буфер
+                        
+                        # Обновляем UI
+                        progress_pct = int(db_count_before / max(participants_count, 1) * 95)
+                        await update_progress_message(update, message_id,
+                            f"⚡ Турбо-сбор (Авто-репит)\n\n"
+                            f"📊 Цель: {participants_count}\n"
+                            f"💾 В базе: {db_count_before}\n"
+                            f"🔥 Найдено в этом проходе: {iteration_new_count}",
+                            progress_pct, True)
 
-            except Exception as e:
-                logger.error(f"Ошибка при поиске '{search_query}': {e}")
-                # Не прерываем весь процесс из-за ошибки одной буквы, идем дальше
-                await asyncio.sleep(1)
+                # Досохраняем остатки после прохода
+                if new_users:
+                    db.upsert_subscribers(new_users, channel_id)
+                    db_count_before += len(new_users)
+                    new_users = []
             
-            # === СОХРАНЯЕМ ПОСЛЕ КАЖДОЙ БУКВЫ ===
-            if new_users:
-                inserted = db.upsert_subscribers(new_users, channel_id)
-                db_count_before += inserted
-                new_users = []
+            except Exception as e:
+                logger.error(f"Ошибка прохода: {e}")
+                await asyncio.sleep(1)
+
+            # Если за полный проход мы никого нового не нашли - значит выжали всё что могли
+            if iteration_new_count == 0:
+                logger.info("Проход не дал новых пользователей. Завершаем.")
+                break
+                
+            logger.info(f"Проход завершен. Найдено новых: {iteration_new_count}. Повторяем...")
+            await asyncio.sleep(1) # Пауза перед следующим заходом
                 
         # Проверка на отмену
         if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
