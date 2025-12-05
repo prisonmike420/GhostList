@@ -1,6 +1,5 @@
-python-telegram-bot==20.3
+python-telegram-bot>=21.0
 telethon==1.30.3
 aiohttp==3.8.5
 python-dotenv==1.0.0
 supabase>=2.0.0
-httpx==0.24.1
