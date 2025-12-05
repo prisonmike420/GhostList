@@ -825,8 +825,8 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                 new_users.append(user_data)
                 user_count += 1
                 
-                # Сохраняем пачками по 500
-                if len(new_users) >= 500:
+                    # Сохраняем пачками по 20 (чаще, чтобы пользователь видел прогресс)
+                if len(new_users) >= 20:
                     await update_progress_message(update, message_id,
                         f"⚡ Турбо-режим\n\n"
                         f"📊 В канале: {participants_count}\n"
@@ -840,14 +840,15 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                     new_users = []  # Очищаем список после сохранения
                     
                 # Обновляем прогресс
-                if user_count % 200 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
+                if user_count % 50 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
                     progress = min(95, int(user_count / max(participants_count, 1) * 95))
                     await update_progress_message(update, message_id,
-                        f"⚡ Турбо-режим\n\n"
+                        f"⚡ Турбо-режим: '{search_query}'\n\n"
                         f"📊 В канале: {participants_count}\n"
                         f"💾 В базе: {db_count_before}\n"
-                        f"🆕 В буфере: {len(new_users)}\n\n"
-                        f"Обработано: {user_count}",
+                        f"🆕 В буфере: {len(new_users)}\n"
+                        f"⏭ Пропущено: {raw_count - len(processed_in_session)}\n\n"
+                        f"Обработано: {len(processed_in_session)}",
                         progress, True)
                     last_update_time = datetime.now()
 
@@ -855,7 +856,13 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                 logger.error(f"Ошибка при поиске '{search_query}': {e}")
                 # Не прерываем весь процесс из-за ошибки одной буквы, идем дальше
                 await asyncio.sleep(1)
-        
+            
+            # === СОХРАНЯЕМ ПОСЛЕ КАЖДОЙ БУКВЫ ===
+            if new_users:
+                inserted = db.upsert_subscribers(new_users, channel_id)
+                db_count_before += inserted
+                new_users = []
+                
         # Проверка на отмену
         if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
             if message_id in active_downloads:
