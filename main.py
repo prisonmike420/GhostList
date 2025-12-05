@@ -762,6 +762,7 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
         
         # Локальный кеш обработанных в этом запуске (чтобы не обрабатывать повторы от разных букв)
         processed_in_session = set()
+        raw_count = 0 
         
         for search_query in search_queries:
             # Проверка на отмену (на каждом шаге цикла букв)
