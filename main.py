@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GhostList v1.2.0 — Telegram-бот для парсинга подписчиков каналов (read-only)
+GhostList v2.0.0 — Telegram-бот для парсинга подписчиков каналов с Supabase
 """
 import os
 import logging
@@ -8,7 +8,7 @@ import asyncio
 import json
 import csv
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,6 +24,9 @@ from telethon import TelegramClient
 from telethon.tl.types import InputPeerChannel, ChannelParticipantsSearch, ChannelParticipantsRecent, ChannelParticipantsAdmins
 from telethon.tl.functions.channels import GetParticipantsRequest, GetFullChannelRequest, GetParticipantRequest
 from telethon.tl.functions.users import GetFullUserRequest
+
+# Импорт клиента Supabase
+import supabase_client as db
 
 # Загрузка переменных окружения
 try:
@@ -699,6 +702,245 @@ async def cancel_download(message_id: int) -> bool:
     return False
 
 
+async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: Update, message_id: int) -> Dict[str, Any]:
+    """Турбо-режим: только iter_participants, сохранение в Supabase
+    
+    Returns:
+        Dict с ключами: new_count, db_count, channel_count
+    """
+    download_tracker = {"cancelled": False}
+    active_downloads[message_id] = download_tracker
+    
+    try:
+        # Получаем информацию о канале
+        participants_count = 0
+        try:
+            full_channel_info = await client(GetFullChannelRequest(channel=channel_peer))
+            participants_count = getattr(full_channel_info.full_chat, 'participants_count', 0)
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о канале: {e}")
+        
+        # Получаем существующие ID из БД
+        existing_ids = db.get_existing_ids(channel_id)
+        db_count_before = len(existing_ids)
+        
+        await update_progress_message(update, message_id,
+            f"⚡ Турбо-режим\n\n"
+            f"📊 В канале: {participants_count}\n"
+            f"💾 В базе: {db_count_before}\n\n"
+            f"Получение подписчиков...",
+            10, True)
+        
+        # Собираем новых пользователей
+        new_users = []
+        user_count = 0
+        last_update_time = datetime.now()
+        
+        async for user in client.iter_participants(channel_peer):
+            if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                break
+            
+            # Проверяем, есть ли уже в БД
+            if user.id in existing_ids:
+                user_count += 1
+                continue
+            
+            # Получаем статус
+            user_status = "Unknown"
+            if hasattr(user, 'status') and user.status:
+                status_name = type(user.status).__name__
+                status_map = {
+                    'UserStatusOnline': 'Online',
+                    'UserStatusOffline': 'Offline',
+                    'UserStatusRecently': 'Recently',
+                    'UserStatusLastWeek': 'Last Week',
+                    'UserStatusLastMonth': 'Last Month',
+                    'UserStatusEmpty': 'Empty'
+                }
+                user_status = status_map.get(status_name, status_name)
+            
+            user_data = {
+                'id': user.id,
+                'username': getattr(user, 'username', None),
+                'firstName': getattr(user, 'first_name', None),
+                'lastName': getattr(user, 'last_name', None),
+                'phone': getattr(user, 'phone', None),
+                'bot': getattr(user, 'bot', False),
+                'status': user_status,
+                'bio': None,
+                'join_date': None
+            }
+            new_users.append(user_data)
+            user_count += 1
+            
+            # Обновляем прогресс
+            if user_count % 200 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
+                progress = min(80, int(user_count / max(participants_count, 1) * 80))
+                await update_progress_message(update, message_id,
+                    f"⚡ Турбо-режим\n\n"
+                    f"📊 В канале: {participants_count}\n"
+                    f"💾 В базе: {db_count_before}\n"
+                    f"🆕 Новых: {len(new_users)}\n\n"
+                    f"Обработано: {user_count}",
+                    progress, True)
+                last_update_time = datetime.now()
+        
+        # Проверка на отмену
+        if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+            if message_id in active_downloads:
+                del active_downloads[message_id]
+            return {"new_count": 0, "db_count": db_count_before, "channel_count": participants_count, "cancelled": True}
+        
+        # Сохраняем в Supabase
+        if new_users:
+            await update_progress_message(update, message_id,
+                f"💾 Сохранение {len(new_users)} новых подписчиков в базу...",
+                85, True)
+            db.upsert_subscribers(new_users, channel_id)
+        
+        # Получаем финальный счётчик
+        db_count_after = db.get_subscriber_count(channel_id)
+        
+        await update_progress_message(update, message_id,
+            f"✅ Турбо-режим завершён!\n\n"
+            f"📊 В канале: {participants_count}\n"
+            f"💾 В базе: {db_count_after}\n"
+            f"🆕 Добавлено: {len(new_users)}",
+            100, False)
+        
+        if message_id in active_downloads:
+            del active_downloads[message_id]
+        
+        return {
+            "new_count": len(new_users),
+            "db_count": db_count_after,
+            "channel_count": participants_count,
+            "cancelled": False
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка турбо-режима: {e}")
+        try:
+            await update_progress_message(update, message_id,
+                f"❌ Ошибка турбо-режима: {e}", 100, False)
+        except Exception:
+            pass
+        if message_id in active_downloads:
+            del active_downloads[message_id]
+        return {"new_count": 0, "db_count": 0, "channel_count": 0, "error": str(e)}
+
+
+async def enrich_subscribers(channel_peer, channel_id: int, update: Update, message_id: int) -> Dict[str, Any]:
+    """Режим обогащения: получение bio и join_date для существующих подписчиков из БД
+    
+    Returns:
+        Dict с ключами: enriched_count, total_needing, skipped
+    """
+    download_tracker = {"cancelled": False}
+    active_downloads[message_id] = download_tracker
+    
+    try:
+        # Получаем подписчиков, которым нужно обогащение
+        needing_enrichment = db.get_subscribers_needing_enrichment(channel_id)
+        total_needing = len(needing_enrichment)
+        
+        if total_needing == 0:
+            await update_progress_message(update, message_id,
+                "✅ Все подписчики уже обогащены!\n\nBio и даты подписки заполнены.",
+                100, False)
+            if message_id in active_downloads:
+                del active_downloads[message_id]
+            return {"enriched_count": 0, "total_needing": 0, "skipped": 0}
+        
+        await update_progress_message(update, message_id,
+            f"📋 Обогащение данных\n\n"
+            f"Подписчиков для обработки: {total_needing}\n\n"
+            f"Получение bio и дат подписки...",
+            5, True)
+        
+        enriched_count = 0
+        skipped = 0
+        last_update_time = datetime.now()
+        
+        for idx, user_record in enumerate(needing_enrichment):
+            if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+                break
+            
+            user_id = user_record['id']
+            bio = None
+            join_date = None
+            
+            try:
+                # Получаем bio
+                full_user = await client(GetFullUserRequest(user_id))
+                bio = getattr(full_user.full_user, 'about', None)
+                
+                # Получаем дату подписки
+                try:
+                    participant = await client(GetParticipantRequest(
+                        channel=channel_peer,
+                        participant=user_id
+                    ))
+                    if hasattr(participant.participant, 'date'):
+                        join_date = participant.participant.date.isoformat()
+                except Exception as e:
+                    logger.debug(f"Не удалось получить дату подписки для {user_id}: {e}")
+                
+                # Обновляем в БД
+                if bio or join_date:
+                    db.update_enrichment(user_id, channel_id, bio, join_date)
+                    enriched_count += 1
+                else:
+                    skipped += 1
+                
+                # Rate limiting
+                await asyncio.sleep(0.3)
+                
+            except Exception as e:
+                logger.error(f"Ошибка обогащения пользователя {user_id}: {e}")
+                skipped += 1
+            
+            # Обновляем прогресс
+            if (idx + 1) % 20 == 0 or (datetime.now() - last_update_time).total_seconds() > 3:
+                progress = min(95, int((idx + 1) / total_needing * 95))
+                await update_progress_message(update, message_id,
+                    f"📋 Обогащение данных\n\n"
+                    f"Обработано: {idx + 1}/{total_needing}\n"
+                    f"Обогащено: {enriched_count}\n"
+                    f"Пропущено: {skipped}",
+                    progress, True)
+                last_update_time = datetime.now()
+        
+        # Проверка на отмену
+        if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
+            if message_id in active_downloads:
+                del active_downloads[message_id]
+            return {"enriched_count": enriched_count, "total_needing": total_needing, "skipped": skipped, "cancelled": True}
+        
+        await update_progress_message(update, message_id,
+            f"✅ Обогащение завершено!\n\n"
+            f"Обработано: {total_needing}\n"
+            f"Обогащено: {enriched_count}\n"
+            f"Пропущено: {skipped}",
+            100, False)
+        
+        if message_id in active_downloads:
+            del active_downloads[message_id]
+        
+        return {"enriched_count": enriched_count, "total_needing": total_needing, "skipped": skipped, "cancelled": False}
+        
+    except Exception as e:
+        logger.error(f"Ошибка режима обогащения: {e}")
+        try:
+            await update_progress_message(update, message_id,
+                f"❌ Ошибка обогащения: {e}", 100, False)
+        except Exception:
+            pass
+        if message_id in active_downloads:
+            del active_downloads[message_id]
+        return {"enriched_count": 0, "total_needing": 0, "skipped": 0, "error": str(e)}
+
+
 async def export_partial_data(update: Update, message_id: int, channel_title: str) -> bool:
     """Экспорт частично полученных данных при отмене выгрузки"""
     if message_id not in active_downloads or not active_downloads[message_id].get("partial_data"):
@@ -733,7 +975,7 @@ async def export_partial_data(update: Update, message_id: int, channel_title: st
 
 
 def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[str, Any]:
-    """Создание CSV файла с подписчиками"""
+    """Создание CSV файла с подписчиками (упрощённый формат)"""
     try:
         logger.info(f"Создание CSV файла для {len(subscribers)} подписчиков канала \"{channel_title}\"...")
 
@@ -747,29 +989,28 @@ def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[
 
         with open(file_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
+            # Упрощённый набор колонок
             writer.writerow([
                 'ID', 'Username', 'First Name', 'Last Name', 'Phone', 
-                'Bot', 'Deleted', 'Premium', 'Verified', 'Restricted', 
-                'Lang Code', 'Status', 'Bio', 'Scam', 'Fake', 'Join Date'
+                'Bot', 'Status', 'Bio', 'Join Date'
             ])
 
             for user in subscribers:
+                # Поддержка обоих форматов: из Telethon и из Supabase
+                username = user.get('username') or user.get('username')
+                first_name = user.get('firstName') or user.get('first_name') or ''
+                last_name = user.get('lastName') or user.get('last_name') or ''
+                is_bot = user.get('bot') or user.get('is_bot', False)
+                
                 writer.writerow([
                     user.get('id', ''),
-                    f"@{user.get('username', '')}" if user.get('username') else '',
-                    user.get('firstName', ''),
-                    user.get('lastName', ''),
-                    user.get('phone', ''),
-                    'Да' if user.get('bot', False) else 'Нет',
-                    'Да' if user.get('deleted', False) else 'Нет',
-                    'Да' if user.get('premium', False) else 'Нет',
-                    'Да' if user.get('verified', False) else 'Нет',
-                    'Да' if user.get('restricted', False) else 'Нет',
-                    user.get('lang_code', '') or '',
-                    user.get('status', 'Unknown'),
+                    f"@{username}" if username else '',
+                    first_name,
+                    last_name,
+                    user.get('phone', '') or '',
+                    'Да' if is_bot else 'Нет',
+                    user.get('status', 'Unknown') or 'Unknown',
                     user.get('bio', '') or '',
-                    'Да' if user.get('is_scam', False) else 'Нет',
-                    'Да' if user.get('is_fake', False) else 'Нет',
                     user.get('join_date', '') or ''
                 ])
 
@@ -778,6 +1019,14 @@ def create_subscribers_csv(subscribers: List[Dict], channel_title: str) -> Dict[
     except Exception as e:
         logger.error(f"Ошибка создания CSV: {e}")
         return None
+
+
+def create_subscribers_csv_from_db(channel_id: int, channel_title: str) -> Dict[str, Any]:
+    """Создание CSV файла с подписчиками из Supabase"""
+    subscribers = db.get_all_subscribers(channel_id)
+    if not subscribers:
+        return None
+    return create_subscribers_csv(subscribers, channel_title)
 
 
 # === Обработчики команд ===
@@ -802,7 +1051,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
 
     await update.message.reply_text(
-        'GhostList v1.2.0 активирован! 🤖\n\n'
+        'GhostList v2.0.0 активирован! 🤖\n\n'
         'Я помогу выгрузить список подписчиков из каналов, где я являюсь администратором.\n\n'
         'Доступные команды:\n'
         '/channels - Показать список добавленных каналов\n'
@@ -822,7 +1071,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
 
     await update.message.reply_text(
-        '*GhostList v1.2.0 - Помощь*\n\n'
+        '*GhostList v2.0.0 - Помощь*\n\n'
         '*Команды:*\n'
         '/start - Начать работу с ботом\n'
         '/channels - Показать список каналов\n'
@@ -832,12 +1081,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         '*Как использовать:*\n'
         '1. Добавьте бота администратором канала\n'
         '2. Добавьте канал командой /addchannel\n'
-        '3. Используйте команду /channels\n'
-        '4. Выберите канал из списка\n'
-        '5. Дождитесь выгрузки CSV файла\n\n'
-        '*Функции:*\n'
-        '• Расширенная информация: биография, дата вступления\n'
-        '• Кнопка "Отменить" — остановка выгрузки',
+        '3. Используйте /channels и выберите канал\n'
+        '4. ⚡ Турбо — быстрый сбор подписчиков\n'
+        '5. 📋 Обогащение — добавить bio и дату\n'
+        '6. 📥 Экспорт — скачать CSV\n\n'
+        '*Особенности:*\n'
+        '• Данные сохраняются в Supabase\n'
+        '• Повторный турбо-режим добирает новых\n'
+        '• Обогащение заполняет только пустые поля',
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -947,7 +1198,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
         ]
         await query.edit_message_text(
-            'GhostList v1.2.0 активирован! 🤖\n\nВыберите действие из меню ниже:',
+            'GhostList v2.0.0 активирован! 🤖\n\nВыберите действие из меню ниже:',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
@@ -967,7 +1218,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data == "help":
         await query.edit_message_text(
-            '*GhostList v1.2.0 - Помощь*\n\n'
+            '*GhostList v2.0.0 - Помощь*\n\n'
             '*Команды:*\n'
             '/start - Начать работу с ботом\n'
             '/channels - Показать список каналов\n'
@@ -977,10 +1228,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             '*Как использовать:*\n'
             '1. Добавьте бота администратором канала\n'
             '2. Добавьте канал командой /addchannel\n'
-            '3. Используйте команду /channels\n'
-            '4. Выберите канал из списка\n'
-            '5. Дождитесь выгрузки CSV файла\n\n'
-            '*Примечание:* Выгрузку можно отменить в любой момент кнопкой "Отменить"',
+            '3. Используйте /channels и выберите канал\n'
+            '4. ⚡ Турбо — быстрый сбор подписчиков\n'
+            '5. 📋 Обогащение — добавить bio и дату\n'
+            '6. 📥 Экспорт — скачать CSV\n\n'
+            '*Особенности:*\n'
+            '• Данные сохраняются в Supabase\n'
+            '• Повторный турбо-режим добирает новых\n'
+            '• Обогащение заполняет только пустые поля',
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
@@ -994,15 +1249,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         channel_id = data.split("_")[1]
         await show_channel_actions(update, channel_id)
 
-    elif data.startswith("parse_ext_"):
-        # Расширенный парсинг (с bio и датой подписки)
+    elif data.startswith("parse_turbo_"):
+        # Турбо-режим парсинга
         channel_id = data.split("_")[2]
-        await run_channel_parsing(update, channel_id, extended_mode=True)
+        await run_turbo_parsing(update, channel_id)
 
-    elif data.startswith("parse_"):
-        # Быстрый парсинг (без bio и даты)
+    elif data.startswith("enrich_"):
+        # Режим обогащения (bio + дата)
         channel_id = data.split("_")[1]
-        await run_channel_parsing(update, channel_id, extended_mode=False)
+        await run_enrichment(update, channel_id)
+
+    elif data.startswith("export_"):
+        # Экспорт CSV из базы
+        channel_id = data.split("_")[1]
+        await run_export_csv(update, channel_id)
 
     elif data.startswith("delete_") or data.startswith("remove_"):
         channel_id = data.split("_")[1]
@@ -1200,96 +1460,267 @@ async def show_channel_actions(update: Update, channel_id: str) -> None:
 
     channel_title = channel_info.get("title", "Канал")
     
+    # Получаем статистику из БД
+    db_count = 0
+    if db.is_supabase_enabled():
+        db_count = db.get_subscriber_count(int(channel_id))
+    
+    # Формируем статус БД
+    db_status = f"💾 В базе: {db_count}" if db.is_supabase_enabled() else "⚠️ База данных не настроена"
+    
     keyboard = [
-        [InlineKeyboardButton("⚡ Быстрый парсинг", callback_data=f"parse_{channel_id}")],
-        [InlineKeyboardButton("📋 Расширенный (+ bio, дата)", callback_data=f"parse_ext_{channel_id}")],
+        [InlineKeyboardButton("⚡ Турбо-режим", callback_data=f"parse_turbo_{channel_id}")],
+        [InlineKeyboardButton("📋 Обогащение (bio + дата)", callback_data=f"enrich_{channel_id}")],
+        [InlineKeyboardButton("📥 Экспорт CSV", callback_data=f"export_{channel_id}")],
         [InlineKeyboardButton("🗑 Удалить канал", callback_data=f"delete_{channel_id}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
     ]
 
     await query.edit_message_text(
         f'Канал: *{channel_title}*\n\n'
-        '⚡ *Быстрый* — только базовая информация\n'
-        '📋 *Расширенный* — + bio и дата подписки (значительно дольше)\n\n'
-        'Выберите режим парсинга:',
+        f'{db_status}\n\n'
+        '⚡ *Турбо* — быстрый сбор подписчиков\n'
+        '📋 *Обогащение* — добавить bio и дату подписки\n'
+        '📥 *Экспорт* — скачать CSV из базы\n\n'
+        'Выберите действие:',
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-async def run_channel_parsing(update: Update, channel_id: str, extended_mode: bool = False) -> None:
-    """Запуск процесса парсинга подписчиков
-    
-    Args:
-        update: Telegram Update
-        channel_id: ID канала
-        extended_mode: Если True, получаем bio и дату подписки (медленнее)
-    """
+async def get_channel_entity(update: Update, channel_id: str):
+    """Получить InputPeerChannel для канала, с обновлением accessHash если нужно"""
+    query = update.callback_query
+    channels = load_channels()
+    channel_info = next((ch for ch in channels if ch["id"] == channel_id), None)
+
+    if not channel_info:
+        await query.edit_message_text(
+            'Канал не найден в списке. Попробуйте добавить его снова.',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+            ])
+        )
+        return None, None
+
+    # Если у канала нет accessHash, пробуем его обновить
+    if not channel_info.get("accessHash"):
+        try:
+            username = channel_info.get("username")
+            if username and username != 'Приватный канал':
+                await query.edit_message_text("Получение дополнительной информации о канале...")
+                entity = await client.get_entity(f"@{username}")
+                if hasattr(entity, 'access_hash'):
+                    channel_info["accessHash"] = str(entity.access_hash)
+
+                    all_channels = load_channels()
+                    idx = next((i for i, ch in enumerate(all_channels) if ch["id"] == channel_id), -1)
+                    if idx != -1:
+                        all_channels[idx]["accessHash"] = channel_info["accessHash"]
+                        save_channels(all_channels)
+            else:
+                await query.edit_message_text(
+                    'Не хватает данных о канале. Пожалуйста, добавьте канал заново через /addchannel',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+                    ])
+                )
+                return None, None
+        except Exception as e:
+            logger.error(f"Не удалось получить accessHash для канала: {e}")
+            await query.edit_message_text(
+                'Не удалось получить доступ к каналу. Пожалуйста, добавьте его снова через /addchannel.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+                ])
+            )
+            return None, None
+
+    # Создаем InputPeerChannel
+    if channel_info.get("accessHash"):
+        channel_entity = InputPeerChannel(
+            channel_id=int(channel_info["id"]),
+            access_hash=int(channel_info["accessHash"])
+        )
+        return channel_entity, channel_info
+    else:
+        await query.edit_message_text(
+            'Недостаточно данных для доступа к каналу. Пожалуйста, добавьте канал заново через /addchannel',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+            ])
+        )
+        return None, None
+
+
+async def run_turbo_parsing(update: Update, channel_id: str) -> None:
+    """Запуск турбо-режима парсинга (iter_participants + Supabase)"""
     query = update.callback_query
 
     try:
-        mode_text = "расширенный режим (+ bio, дата подписки)" if extended_mode else "быстрый режим"
-        warning = "\n\n⚠️ Расширенный режим может занять значительное время!" if extended_mode else ""
-        
-        await query.edit_message_text(
-            f'Получение списка подписчиков...\n'
-            f'Режим: {mode_text}{warning}'
+        # Проверяем Supabase
+        if not db.is_supabase_enabled():
+            await query.edit_message_text(
+                '⚠️ База данных не настроена!\n\n'
+                'Добавьте SUPABASE_URL и SUPABASE_KEY в переменные окружения.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
+                ])
+            )
+            return
+
+        await query.edit_message_text('⚡ Запуск турбо-режима...')
+
+        channel_entity, channel_info = await get_channel_entity(update, channel_id)
+        if not channel_entity:
+            return
+
+        channel_title = channel_info.get("title", "Канал")
+
+        # Запускаем турбо-парсинг
+        result = await get_channel_subscribers_turbo(
+            channel_entity, 
+            int(channel_id), 
+            update, 
+            query.message.message_id
         )
+
+        if result.get("cancelled"):
+            return
+
+        if result.get("error"):
+            await query.edit_message_text(
+                f'❌ Ошибка: {result["error"]}',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
+                ])
+            )
+            return
+
+        # Показываем результат
+        db_count = result.get("db_count", 0)
+        channel_count = result.get("channel_count", 0)
+        new_count = result.get("new_count", 0)
+        
+        progress_pct = int(db_count / max(channel_count, 1) * 100)
+        progress_bar = '█' * (progress_pct // 5) + '░' * (20 - progress_pct // 5)
+
+        await query.edit_message_text(
+            f'✅ Турбо-режим завершён!\n\n'
+            f'Канал: *{channel_title}*\n\n'
+            f'📊 В канале: {channel_count}\n'
+            f'💾 В базе: {db_count}\n'
+            f'🆕 Добавлено: {new_count}\n\n'
+            f'[{progress_bar}] {progress_pct}%\n\n'
+            f'{"✅ Все подписчики собраны!" if db_count >= channel_count else "⚡ Запустите ещё раз для добора"}',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Ещё раз", callback_data=f"parse_turbo_{channel_id}")],
+                [InlineKeyboardButton("📥 Экспорт CSV", callback_data=f"export_{channel_id}")],
+                [InlineKeyboardButton("⬅️ К каналу", callback_data=f"channel_{channel_id}")]
+            ])
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка турбо-парсинга: {e}")
+        await query.edit_message_text(
+            f'❌ Ошибка: {e}',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
+            ])
+        )
+
+
+async def run_enrichment(update: Update, channel_id: str) -> None:
+    """Запуск режима обогащения (bio + join_date)"""
+    query = update.callback_query
+
+    try:
+        # Проверяем Supabase
+        if not db.is_supabase_enabled():
+            await query.edit_message_text(
+                '⚠️ База данных не настроена!\n\n'
+                'Добавьте SUPABASE_URL и SUPABASE_KEY в переменные окружения.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
+                ])
+            )
+            return
+
+        await query.edit_message_text('📋 Запуск обогащения...')
+
+        channel_entity, channel_info = await get_channel_entity(update, channel_id)
+        if not channel_entity:
+            return
+
+        channel_title = channel_info.get("title", "Канал")
+
+        # Запускаем обогащение
+        result = await enrich_subscribers(
+            channel_entity, 
+            int(channel_id), 
+            update, 
+            query.message.message_id
+        )
+
+        if result.get("cancelled"):
+            return
+
+        if result.get("error"):
+            await query.edit_message_text(
+                f'❌ Ошибка: {result["error"]}',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
+                ])
+            )
+            return
+
+        # Показываем результат
+        await query.edit_message_text(
+            f'✅ Обогащение завершено!\n\n'
+            f'Канал: *{channel_title}*\n\n'
+            f'📋 Обработано: {result.get("total_needing", 0)}\n'
+            f'✅ Обогащено: {result.get("enriched_count", 0)}\n'
+            f'⏭ Пропущено: {result.get("skipped", 0)}',
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 Экспорт CSV", callback_data=f"export_{channel_id}")],
+                [InlineKeyboardButton("⬅️ К каналу", callback_data=f"channel_{channel_id}")]
+            ])
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка обогащения: {e}")
+        await query.edit_message_text(
+            f'❌ Ошибка: {e}',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
+            ])
+        )
+
+
+async def run_export_csv(update: Update, channel_id: str) -> None:
+    """Экспорт CSV из Supabase"""
+    query = update.callback_query
+
+    try:
+        # Проверяем Supabase
+        if not db.is_supabase_enabled():
+            await query.edit_message_text(
+                '⚠️ База данных не настроена!\n\n'
+                'Добавьте SUPABASE_URL и SUPABASE_KEY в переменные окружения.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
+                ])
+            )
+            return
 
         channels = load_channels()
         channel_info = next((ch for ch in channels if ch["id"] == channel_id), None)
 
         if not channel_info:
             await query.edit_message_text(
-                'Канал не найден в списке. Попробуйте добавить его снова.',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
-                ])
-            )
-            return
-
-        # Если у канала нет accessHash, пробуем его обновить
-        if not channel_info.get("accessHash"):
-            try:
-                username = channel_info.get("username")
-                if username and username != 'Приватный канал':
-                    await query.edit_message_text("Получение дополнительной информации о канале...")
-                    entity = await client.get_entity(f"@{username}")
-                    if hasattr(entity, 'access_hash'):
-                        channel_info["accessHash"] = str(entity.access_hash)
-
-                        all_channels = load_channels()
-                        idx = next((i for i, ch in enumerate(all_channels) if ch["id"] == channel_id), -1)
-                        if idx != -1:
-                            all_channels[idx]["accessHash"] = channel_info["accessHash"]
-                            save_channels(all_channels)
-                else:
-                    await query.edit_message_text(
-                        'Не хватает данных о канале. Пожалуйста, добавьте канал заново через /addchannel',
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
-                        ])
-                    )
-                    return
-            except Exception as e:
-                logger.error(f"Не удалось получить accessHash для канала: {e}")
-                await query.edit_message_text(
-                    'Не удалось получить доступ к каналу. Пожалуйста, добавьте его снова через /addchannel.',
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
-                    ])
-                )
-                return
-
-        # Создаем InputPeerChannel
-        if channel_info.get("accessHash"):
-            channel_entity = InputPeerChannel(
-                channel_id=int(channel_info["id"]),
-                access_hash=int(channel_info["accessHash"])
-            )
-        else:
-            await query.edit_message_text(
-                'Недостаточно данных для доступа к каналу. Пожалуйста, добавьте канал заново через /addchannel',
+                'Канал не найден в списке.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
                 ])
@@ -1298,31 +1729,18 @@ async def run_channel_parsing(update: Update, channel_id: str, extended_mode: bo
 
         channel_title = channel_info.get("title", "Канал")
 
-        # Получаем подписчиков
-        subscribers = await get_channel_subscribers(channel_entity, update, query.message.message_id, extended_mode)
+        await query.edit_message_text(f'📥 Экспорт данных из базы...')
 
-        if subscribers is None:
-            return
-
-        if not subscribers:
-            await query.edit_message_text(
-                f"Не удалось получить подписчиков канала \"{channel_title}\" или канал пуст.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
-                ])
-            )
-            return
-
-        # Создаем CSV файл
-        await query.edit_message_text(f"Создание CSV файла с {len(subscribers)} подписчиками...")
-
-        csv_result = create_subscribers_csv(subscribers, channel_title)
+        # Создаем CSV из БД
+        csv_result = create_subscribers_csv_from_db(int(channel_id), channel_title)
 
         if not csv_result:
             await query.edit_message_text(
-                'Ошибка при создании файла.',
+                '❌ Нет данных для экспорта.\n\n'
+                'Сначала запустите турбо-режим для сбора подписчиков.',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+                    [InlineKeyboardButton("⚡ Турбо-режим", callback_data=f"parse_turbo_{channel_id}")],
+                    [InlineKeyboardButton("⬅️ К каналу", callback_data=f"channel_{channel_id}")]
                 ])
             )
             return
@@ -1332,7 +1750,7 @@ async def run_channel_parsing(update: Update, channel_id: str, extended_mode: bo
             await update.effective_chat.send_document(
                 document=file,
                 filename=csv_result["fileName"],
-                caption=f"✅ Выгрузка завершена!\nКанал: {channel_title}\nПодписчиков: {csv_result['count']}"
+                caption=f"✅ Экспорт завершён!\nКанал: {channel_title}\nПодписчиков: {csv_result['count']}"
             )
 
         # Удаляем файл после отправки
@@ -1340,19 +1758,23 @@ async def run_channel_parsing(update: Update, channel_id: str, extended_mode: bo
             os.remove(csv_result["filePath"])
 
         await query.edit_message_text(
-            'Готово! Что делаем дальше?',
+            f'✅ CSV отправлен!\n\n'
+            f'Канал: *{channel_title}*\n'
+            f'Подписчиков: {csv_result["count"]}',
+            parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Список каналов", callback_data="channels_list")],
-                [InlineKeyboardButton("⬅️ Назад к каналу", callback_data=f"channel_{channel_id}")]
+                [InlineKeyboardButton("⚡ Турбо-режим", callback_data=f"parse_turbo_{channel_id}")],
+                [InlineKeyboardButton("📋 Обогащение", callback_data=f"enrich_{channel_id}")],
+                [InlineKeyboardButton("⬅️ К каналу", callback_data=f"channel_{channel_id}")]
             ])
         )
 
     except Exception as e:
-        logger.error(f"Ошибка в процессе выбора канала: {e}")
+        logger.error(f"Ошибка экспорта CSV: {e}")
         await query.edit_message_text(
-            f'Произошла ошибка: {e}',
+            f'❌ Ошибка: {e}',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="channels_list")]
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"channel_{channel_id}")]
             ])
         )
 
@@ -1363,7 +1785,7 @@ async def main() -> None:
     """Запуск бота"""
     global client
 
-    logger.info('GhostList v1.2.0 запускается...')
+    logger.info('GhostList v2.0.0 запускается...')
 
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
