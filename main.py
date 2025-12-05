@@ -754,66 +754,64 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                 if message_id in active_downloads and active_downloads[message_id]["cancelled"]:
                     break
             
-            # Проверяем, есть ли уже в БД
-            if user.id in existing_ids:
-                user_count += 1
-                continue
-            
-            # Получаем статус
-            user_status = "Unknown"
-            if hasattr(user, 'status') and user.status:
-                status_name = type(user.status).__name__
-                status_map = {
-                    'UserStatusOnline': 'Online',
-                    'UserStatusOffline': 'Offline',
-                    'UserStatusRecently': 'Recently',
-                    'UserStatusLastWeek': 'Last Week',
-                    'UserStatusLastMonth': 'Last Month',
-                    'UserStatusEmpty': 'Empty'
+                # Проверяем, есть ли уже в БД
+                if user.id in existing_ids:
+                    user_count += 1
+                    continue
+                
+                # Получаем статус
+                user_status = "Unknown"
+                if hasattr(user, 'status') and user.status:
+                    status_name = type(user.status).__name__
+                    status_map = {
+                        'UserStatusOnline': 'Online',
+                        'UserStatusOffline': 'Offline',
+                        'UserStatusRecently': 'Recently',
+                        'UserStatusLastWeek': 'Last Week',
+                        'UserStatusLastMonth': 'Last Month',
+                        'UserStatusEmpty': 'Empty'
+                    }
+                    user_status = status_map.get(status_name, status_name)
+                
+                user_data = {
+                    'id': user.id,
+                    'username': getattr(user, 'username', None),
+                    'firstName': getattr(user, 'first_name', None),
+                    'lastName': getattr(user, 'last_name', None),
+                    'phone': getattr(user, 'phone', None),
+                    'bot': getattr(user, 'bot', False),
+                    'status': user_status,
+                    'bio': None,
+                    'join_date': None
                 }
-                user_status = status_map.get(status_name, status_name)
-            
-            user_data = {
-                'id': user.id,
-                'username': getattr(user, 'username', None),
-                'firstName': getattr(user, 'first_name', None),
-                'lastName': getattr(user, 'last_name', None),
-                'phone': getattr(user, 'phone', None),
-                'bot': getattr(user, 'bot', False),
-                'status': user_status,
-                'bio': None,
-                'join_date': None
-            }
-            new_users.append(user_data)
-            user_count += 1
-            
-            # Сохраняем пачками по 500
-            if len(new_users) >= 500:
-                await update_progress_message(update, message_id,
-                    f"⚡ Турбо-режим\n\n"
-                    f"📊 В канале: {participants_count}\n"
-                    f"💾 В базе: {db_count_before}\n"
-                    f"🆕 Новых: {len(existing_ids) + len(new_users)}\n\n"
-                    f"Сохранение пачки...",
-                    progress, True)
+                new_users.append(user_data)
+                user_count += 1
                 
-                inserted = db.upsert_subscribers(new_users, channel_id)
-                db_count_before += inserted
-                new_users = []  # Очищаем список после сохранения
-                
-            # Обновляем прогресс
-            if user_count % 200 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
-                progress = min(95, int(user_count / max(participants_count, 1) * 95))
-                await update_progress_message(update, message_id,
-                    f"⚡ Турбо-режим\n\n"
-                    f"📊 В канале: {participants_count}\n"
-                    f"💾 В базе: {db_count_before}\n"
-                    f"🆕 В буфере: {len(new_users)}\n\n"
-                    f"Обработано: {user_count}",
-                    progress, True)
-                last_update_time = datetime.now()
-        
-                last_update_time = datetime.now()
+                # Сохраняем пачками по 500
+                if len(new_users) >= 500:
+                    await update_progress_message(update, message_id,
+                        f"⚡ Турбо-режим\n\n"
+                        f"📊 В канале: {participants_count}\n"
+                        f"💾 В базе: {db_count_before}\n"
+                        f"🆕 Новых: {len(existing_ids) + len(new_users)}\n\n"
+                        f"Сохранение пачки...",
+                        progress, True)
+                    
+                    inserted = db.upsert_subscribers(new_users, channel_id)
+                    db_count_before += inserted
+                    new_users = []  # Очищаем список после сохранения
+                    
+                # Обновляем прогресс
+                if user_count % 200 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
+                    progress = min(95, int(user_count / max(participants_count, 1) * 95))
+                    await update_progress_message(update, message_id,
+                        f"⚡ Турбо-режим\n\n"
+                        f"📊 В канале: {participants_count}\n"
+                        f"💾 В базе: {db_count_before}\n"
+                        f"🆕 В буфере: {len(new_users)}\n\n"
+                        f"Обработано: {user_count}",
+                        progress, True)
+                    last_update_time = datetime.now()
 
         except Exception as e:
             logger.error(f"Ошибка в цикле iter_participants: {e}")
