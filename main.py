@@ -773,14 +773,28 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
             new_users.append(user_data)
             user_count += 1
             
-            # Обновляем прогресс
-            if user_count % 200 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
-                progress = min(80, int(user_count / max(participants_count, 1) * 80))
+            # Сохраняем пачками по 500
+            if len(new_users) >= 500:
                 await update_progress_message(update, message_id,
                     f"⚡ Турбо-режим\n\n"
                     f"📊 В канале: {participants_count}\n"
                     f"💾 В базе: {db_count_before}\n"
-                    f"🆕 Новых: {len(new_users)}\n\n"
+                    f"🆕 Новых: {len(existing_ids) + len(new_users)}\n\n"
+                    f"Сохранение пачки...",
+                    progress, True)
+                
+                inserted = db.upsert_subscribers(new_users, channel_id)
+                db_count_before += inserted
+                new_users = []  # Очищаем список после сохранения
+                
+            # Обновляем прогресс
+            if user_count % 200 == 0 or (datetime.now() - last_update_time).total_seconds() > 2:
+                progress = min(95, int(user_count / max(participants_count, 1) * 95))
+                await update_progress_message(update, message_id,
+                    f"⚡ Турбо-режим\n\n"
+                    f"📊 В канале: {participants_count}\n"
+                    f"💾 В базе: {db_count_before}\n"
+                    f"🆕 В буфере: {len(new_users)}\n\n"
                     f"Обработано: {user_count}",
                     progress, True)
                 last_update_time = datetime.now()
@@ -791,12 +805,13 @@ async def get_channel_subscribers_turbo(channel_peer, channel_id: int, update: U
                 del active_downloads[message_id]
             return {"new_count": 0, "db_count": db_count_before, "channel_count": participants_count, "cancelled": True}
         
-        # Сохраняем в Supabase
+        # Сохраняем остаток в Supabase
         if new_users:
             await update_progress_message(update, message_id,
-                f"💾 Сохранение {len(new_users)} новых подписчиков в базу...",
-                85, True)
-            db.upsert_subscribers(new_users, channel_id)
+                f"💾 Сохранение последних {len(new_users)} подписчиков...",
+                98, True)
+            inserted = db.upsert_subscribers(new_users, channel_id)
+            db_count_before += inserted
         
         # Получаем финальный счётчик
         db_count_after = db.get_subscriber_count(channel_id)
@@ -897,6 +912,17 @@ async def enrich_subscribers(channel_peer, channel_id: int, update: Update, mess
                 await asyncio.sleep(0.3)
                 
             except Exception as e:
+                # Проверяем FloodWait (защита от бана)
+                if "FloodWait" in str(type(e).__name__) or hasattr(e, 'seconds'):
+                    wait_time = getattr(e, 'seconds', 60)
+                    logger.warning(f"⚠️ FloodWait: Ждем {wait_time} секунд...")
+                    await update_progress_message(update, message_id,
+                        f"⏳ Telegram просит подождать {wait_time}с...\nНе закрывайте бота.",
+                        progress, False)
+                    await asyncio.sleep(wait_time + 2)
+                    skipped += 1
+                    continue
+                
                 logger.error(f"Ошибка обогащения пользователя {user_id}: {e}")
                 skipped += 1
             
