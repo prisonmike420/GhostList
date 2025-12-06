@@ -1738,13 +1738,25 @@ async def run_turbo_parsing(update: Update, channel_id: str) -> None:
 
         channel_title = channel_info.get("title", "Канал")
 
-        # Запускаем турбо-парсинг
-        result = await get_channel_subscribers_turbo(
-            channel_entity, 
-            int(channel_id), 
-            update, 
-            query.message.message_id
+        # Запускаем турбо-парсинг в именованной задаче для возможности отмены
+        task_name = f"download_{query.message.message_id}"
+        logger.info(f"Запуск задачи парсинга: {task_name}")
+        
+        task = asyncio.create_task(
+            get_channel_subscribers_turbo(
+                channel_entity, 
+                int(channel_id), 
+                update, 
+                query.message.message_id
+            ),
+            name=task_name
         )
+
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            logger.info("Задача парсинга была отменена (CancelledError)")
+            result = {"cancelled": True}
 
         if result.get("cancelled"):
             return
