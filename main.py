@@ -1523,7 +1523,8 @@ async def show_channels_list(update: Update) -> None:
     for channel in channels:
         keyboard.append([InlineKeyboardButton(channel["title"], callback_data=f"channel_{channel['id']}")])
 
-    keyboard.append([InlineKeyboardButton("🗑 Удалить канал", callback_data="remove_channel_menu")])
+    # Кнопка удаления перенесена в меню канала
+    # keyboard.append([InlineKeyboardButton("🗑 Удалить канал", callback_data="remove_channel_menu")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
 
     message = 'Выберите канал для выгрузки подписчиков:'
@@ -1759,6 +1760,12 @@ async def run_turbo_parsing(update: Update, channel_id: str) -> None:
             result = {"cancelled": True}
 
         if result.get("cancelled"):
+            await query.edit_message_text(
+                '🛑 Парсинг остановлен пользователем.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ К каналу", callback_data=f"channel_{channel_id}")]
+                ])
+            )
             return
 
         if result.get("error"):
@@ -1828,15 +1835,35 @@ async def run_enrichment(update: Update, channel_id: str) -> None:
 
         channel_title = channel_info.get("title", "Канал")
 
-        # Запускаем обогащение
-        result = await enrich_subscribers(
-            channel_entity, 
-            int(channel_id), 
-            update, 
-            query.message.message_id
+        channel_title = channel_info.get("title", "Канал")
+
+        # Запускаем обогащение в именованной задаче для возможности отмены
+        task_name = f"download_{query.message.message_id}"
+        logger.info(f"Запуск задачи обогащения: {task_name}")
+
+        task = asyncio.create_task(
+            enrich_subscribers(
+                channel_entity, 
+                int(channel_id), 
+                update, 
+                query.message.message_id
+            ),
+            name=task_name
         )
 
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            logger.info("Задача обогащения была отменена (CancelledError)")
+            result = {"cancelled": True}
+
         if result.get("cancelled"):
+            await query.edit_message_text(
+                '🛑 Обогащение остановлено пользователем.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ К каналу", callback_data=f"channel_{channel_id}")]
+                ])
+            )
             return
 
         if result.get("error"):
